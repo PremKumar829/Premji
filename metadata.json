@@ -1,0 +1,6 @@
+{
+  "name": "SlotTrack Bot — Telegram & Google Sheets Report Automation",
+  "description": "Production Python Telegram bot (python-telegram-bot v20+ & gspread) with IST slot validation, Google Sheets logging, live slot simulator, and cloud deployment guide.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
