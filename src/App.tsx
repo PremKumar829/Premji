@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  Bell,
+  BellOff,
   Check,
   CheckCircle2,
   Clock,
   Copy,
+  Database,
   Download,
   FileCode2,
   FileSpreadsheet,
@@ -20,6 +23,7 @@ import {
   BOT_PY_SOURCE,
   INITIAL_SHEET_ROWS,
   INITIAL_TEAM_ROSTER,
+  RENDER_ENV_BLOCK,
   REPORTING_SLOTS,
   REQUIREMENTS_TXT_SOURCE,
   SETUP_STEPS,
@@ -30,6 +34,7 @@ import {
 type CodeTab = 'bot.py' | 'requirements.txt';
 type PreviewTab = 'log' | 'matrix';
 type StatusFilter = 'all' | 'on_time' | 'late';
+type ReminderPreviewMode = 'open' | 'final_warning';
 
 const TIME_PRESETS = [
   { label: '10:08 AM', value: '10:08:24' },
@@ -43,7 +48,7 @@ const TIME_PRESETS = [
   { label: '8:18 PM (Late)', value: '20:18:10' },
 ];
 
-const CHECKLIST_STORAGE_KEY = 'slottrack_excel_render_checklist_v2';
+const CHECKLIST_STORAGE_KEY = 'slottrack_excel_render_checklist_v3';
 
 export default function App() {
   const [activeCodeTab, setActiveCodeTab] = useState<CodeTab>('bot.py');
@@ -58,6 +63,11 @@ export default function App() {
   const [simCaption, setSimCaption] = useState('Morning site update');
   const [preventDuplicates, setPreventDuplicates] = useState(true);
   const [duplicateNotice, setDuplicateNotice] = useState<string | null>(null);
+
+  // Reminder ON/OFF & DB Group Sync state
+  const [remindersEnabled, setRemindersEnabled] = useState(true);
+  const [reminderSlotId, setReminderSlotId] = useState('10am');
+  const [reminderPreviewMode, setReminderPreviewMode] = useState<ReminderPreviewMode>('open');
 
   // Excel table & roster state
   const [sheetRows, setSheetRows] = useState<SheetRow[]>(INITIAL_SHEET_ROWS);
@@ -136,6 +146,44 @@ export default function App() {
     });
   }, [teamRoster, sheetRows, simDate]);
 
+  // Live preview of tagged assistant reminder message
+  const selectedSlotObj =
+    REPORTING_SLOTS.find((s) => s.id === reminderSlotId) ?? REPORTING_SLOTS[0];
+
+  const pendingAssistantsForSelectedSlot = useMemo(() => {
+    const submitted = new Set(
+      sheetRows
+        .filter((r) => r.date === simDate && r.reportingSlot === selectedSlotObj.label)
+        .map((r) => r.username.toLowerCase())
+    );
+    return teamRoster.filter((m) => !submitted.has(m.toLowerCase()));
+  }, [teamRoster, sheetRows, simDate, selectedSlotObj]);
+
+  const reminderMessagePreview = useMemo(() => {
+    if (!remindersEnabled) {
+      return 'Reminders are currently OFF (/reminder off). No slot alerts or assistant tags will be sent to the work group.';
+    }
+    const allTags = teamRoster.length ? teamRoster.join(' ') : '@all';
+    if (reminderPreviewMode === 'open') {
+      if (selectedSlotObj.id === 'final') {
+        return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\nAttention: ${allTags}\nPlease upload your photo report before 8:00 PM IST (grace period ends 8:15 PM IST). Submissions after 8:15 PM will be marked Late / Penalty.`;
+      }
+      return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\nAttention: ${allTags}\nUpload your photo report within 15 minutes to stay On Time. Late uploads will trigger a Penalty mark.`;
+    }
+    if (pendingAssistantsForSelectedSlot.length === 0) {
+      return `All registered assistants have already submitted ${selectedSlotObj.label}. No 5-minute final warning needed.`;
+    }
+    return `FINAL WARNING (5 MINUTES LEFT) — ${selectedSlotObj.label}\nPending Assistants: ${pendingAssistantsForSelectedSlot.join(' ')}\nUpload your photo report immediately! Grace period closes in 5 minutes, after which your slot will be marked Late / Penalty.`;
+  }, [
+    remindersEnabled,
+    reminderPreviewMode,
+    selectedSlotObj,
+    teamRoster,
+    pendingAssistantsForSelectedSlot,
+  ]);
+
+  const latestDbSyncRow = sheetRows[0] ?? INITIAL_SHEET_ROWS[0];
+
   const handleCopy = async (text: string, id: string) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -199,8 +247,9 @@ export default function App() {
     e.preventDefault();
     const clean = newMemberInput.trim();
     if (!clean) return;
-    if (!teamRoster.some((m) => m.toLowerCase() === clean.toLowerCase())) {
-      setTeamRoster((prev) => [...prev, clean]);
+    const normalized = clean.startsWith('@') || clean.includes(' ') ? clean : `@${clean}`;
+    if (!teamRoster.some((m) => m.toLowerCase() === normalized.toLowerCase())) {
+      setTeamRoster((prev) => [...prev, normalized]);
     }
     setNewMemberInput('');
   };
@@ -253,16 +302,16 @@ export default function App() {
               Slot Simulator
             </a>
             <a
+              href="#reminders-db"
+              className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
+            >
+              Warnings &amp; DB Sync
+            </a>
+            <a
               href="#excel-preview"
               className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
             >
               Excel &amp; Matrix
-            </a>
-            <a
-              href="#commands"
-              className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
-            >
-              Commands
             </a>
             <a
               href="#bot-code"
@@ -274,7 +323,7 @@ export default function App() {
               href="#render-setup"
               className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
             >
-              Render Guide
+              Render &amp; .env
             </a>
           </nav>
 
@@ -296,29 +345,31 @@ export default function App() {
         <section className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
           <div className="lg:col-span-7 space-y-4">
             <p className="text-xs font-medium text-slate-500">
-              GitHub + Render Free Tier · 4-Sheet Excel (.xlsx) · Slot Reminders · Duplicate Guard
+              GitHub + Render Free · Live DB Group Sync · Assistant Tag Warnings · /reminder on | off
             </p>
             <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-slate-900 [text-wrap:balance]">
-              Telegram Team Photo Report Bot with Automated Excel &amp; Compliance Matrix
+              Telegram Photo Report Bot with Live DB Group Sync &amp; Assistant Warning Alerts
             </h1>
             <p className="text-base leading-relaxed text-slate-600 max-w-2xl">
-              Zero Google Cloud setup. Tracks group photo reports with captions in IST, prevents
-              accidental duplicate slot entries, nudges the group at each slot window, and sends a
-              4-sheet formatted <code className="font-mono text-sm text-slate-800">.xlsx</code>{' '}
-              workbook plus database backup straight to your Telegram DM at 8:30 PM IST.
+              Every time a photo report is submitted for a slot, the bot saves it and immediately
+              pushes <code className="font-mono text-sm text-slate-800">reports.db</code> to your
+              dedicated Database Group. Built-in slot reminders tag registered assistants with
+              warnings and can be switched ON or OFF anytime via{' '}
+              <code className="font-mono text-sm text-slate-800">/reminder on</code> /{' '}
+              <code className="font-mono text-sm text-slate-800">/reminder off</code>.
             </p>
             <div className="pt-2 flex flex-wrap items-center gap-6 text-sm text-slate-700">
               <div>
-                <span className="text-slate-500">Deploy:</span>{' '}
-                <span className="font-mono font-medium">GitHub + Render Free</span>
+                <span className="text-slate-500">DB Sync:</span>{' '}
+                <span className="font-mono font-medium">Per Slot Submission</span>
               </div>
               <span className="text-slate-300" aria-hidden="true">
                 |
               </span>
               <div>
-                <span className="text-slate-500">Workbook Sheets:</span>{' '}
+                <span className="text-slate-500">Excel Delivery:</span>{' '}
                 <span className="font-mono text-xs font-medium">
-                  Reports · Member Summary · Slot Matrix · All History
+                  8:30 PM IST Auto-DM + /excel
                 </span>
               </div>
             </div>
@@ -328,7 +379,7 @@ export default function App() {
           <div className="lg:col-span-5 rounded-xl border border-slate-200 bg-white p-5">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <h2 className="text-sm font-semibold text-slate-900">
-                Designated IST Windows &amp; Reminders
+                Designated IST Windows &amp; Warnings
               </h2>
               <span className="text-xs font-mono text-slate-500">+15m grace</span>
             </div>
@@ -355,8 +406,8 @@ export default function App() {
               01. IST Slot, Caption &amp; Duplicate Guard Simulator
             </h2>
             <p className="text-sm text-slate-600">
-              Test timestamps, photo captions, and duplicate-slot protection against the exact logic
-              in <code className="font-mono text-xs text-slate-800">bot.py</code>.
+              Simulate a group photo upload to test IST slot classification and instant DB Group
+              sync.
             </p>
           </div>
 
@@ -576,25 +627,178 @@ export default function App() {
               <div className="text-xs text-slate-500 pt-2 border-t border-slate-100 flex items-center gap-2">
                 <Clock className="h-3.5 w-3.5 text-slate-400 shrink-0" aria-hidden="true" />
                 <span>
-                  Auto-sends 4-sheet <code className="font-mono text-slate-700">.xlsx</code> + DB
-                  backup at 8:30 PM IST.
+                  Also pushes <code className="font-mono text-slate-700">reports.db</code> to DB
+                  Backup Group immediately.
                 </span>
               </div>
             </div>
           </div>
         </section>
 
-        {/* Section 2: Excel (.xlsx) Submissions Log & Slot Compliance Matrix */}
+        {/* Section 2: Assistant Tagging Warnings (/reminder on|off) & Live DB Group Sync */}
+        <section id="reminders-db" className="scroll-mt-20 space-y-4">
+          <div>
+            <h2 className="text-xl font-bold tracking-tight text-slate-900">
+              02. Assistant Tagging Warnings &amp; Database Group Sync
+            </h2>
+            <p className="text-sm text-slate-600">
+              Preview live <code className="font-mono text-xs">/reminder on | off</code> behavior
+              and the automatic <code className="font-mono text-xs">reports.db</code> push sent on
+              every slot report.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
+            {/* Reminder Control & Assistant Tag Warning Preview */}
+            <div className="lg:col-span-7 rounded-xl border border-slate-200 bg-white p-6 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-4 pb-3 border-b border-slate-100">
+                <div className="flex items-center gap-2">
+                  {remindersEnabled ? (
+                    <Bell className="h-4 w-4 text-sky-600" aria-hidden="true" />
+                  ) : (
+                    <BellOff className="h-4 w-4 text-slate-400" aria-hidden="true" />
+                  )}
+                  <span className="text-sm font-semibold text-slate-900">
+                    Slot Reminders &amp; Warnings
+                  </span>
+                  <span
+                    className={`text-xs font-mono font-semibold ${
+                      remindersEnabled ? 'text-emerald-700' : 'text-slate-500'
+                    }`}
+                  >
+                    ({remindersEnabled ? 'ON' : 'OFF'})
+                  </span>
+                </div>
+
+                <div className="inline-flex items-center gap-1 rounded-lg bg-slate-200/70 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setRemindersEnabled(true)}
+                    className={`rounded-md px-3 py-1 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      remindersEnabled
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    /reminder on
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRemindersEnabled(false)}
+                    className={`rounded-md px-3 py-1 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      !remindersEnabled
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    /reminder off
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap gap-1.5">
+                  {REPORTING_SLOTS.map((slot) => (
+                    <button
+                      key={slot.id}
+                      type="button"
+                      onClick={() => setReminderSlotId(slot.id)}
+                      className={`rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                        reminderSlotId === slot.id
+                          ? 'border-sky-600 bg-sky-50 text-sky-700'
+                          : 'border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
+                      }`}
+                    >
+                      {slot.shortLabel}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="inline-flex items-center gap-1 rounded-lg bg-slate-200/70 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setReminderPreviewMode('open')}
+                    className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      reminderPreviewMode === 'open'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Slot Open Tag
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setReminderPreviewMode('final_warning')}
+                    className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      reminderPreviewMode === 'final_warning'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    5-Min Final Warning
+                  </button>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+                <pre className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-slate-800">
+                  {reminderMessagePreview}
+                </pre>
+              </div>
+            </div>
+
+            {/* Live Database Backup Group Sync Card */}
+            <div className="lg:col-span-5 rounded-xl border border-slate-200 bg-white p-6 flex flex-col justify-between space-y-4">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                  <div className="flex items-center gap-2">
+                    <Database className="h-4 w-4 text-sky-600" aria-hidden="true" />
+                    <span className="text-sm font-semibold text-slate-900">
+                      DB Backup Group Dispatch
+                    </span>
+                  </div>
+                  <span className="text-xs font-mono text-slate-500">Per Report</span>
+                </div>
+
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Whenever a report is saved in the work group, the bot sends the updated{' '}
+                  <code className="font-mono text-slate-800">reports.db</code> file to your
+                  Database Backup Group (<code className="font-mono">DB_BACKUP_CHAT_ID</code>) and
+                  silently pins it for auto-restore on Render restarts.
+                </p>
+
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-2">
+                  <div className="flex items-center justify-between text-xs font-mono text-slate-700 border-b border-slate-200 pb-2">
+                    <span>Attachment: reports.db</span>
+                    <span>Auto-Pinned</span>
+                  </div>
+                  <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-slate-800">
+                    {`DB Sync | ${latestDbSyncRow.username} | ${latestDbSyncRow.reportingSlot}\nTime: ${latestDbSyncRow.submissionTime} | Date: ${latestDbSyncRow.date} | Status: ${latestDbSyncRow.status}${
+                      latestDbSyncRow.caption ? `\nNote: ${latestDbSyncRow.caption}` : ''
+                    }`}
+                  </pre>
+                </div>
+              </div>
+
+              <div className="text-xs text-slate-500 pt-2 border-t border-slate-100">
+                Link anytime by typing <code className="font-mono text-slate-700">/setdbgroup</code>{' '}
+                inside your database group.
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Section 3: Excel (.xlsx) Submissions Log & Slot Compliance Matrix */}
         <section id="excel-preview" className="scroll-mt-20 space-y-4">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
               <h2 className="text-xl font-bold tracking-tight text-slate-900">
-                02. Excel Workbook (.xlsx) &amp; Team Compliance Matrix
+                03. Excel Workbook (.xlsx) &amp; Assistant Compliance Matrix
               </h2>
               <p className="text-sm text-slate-600">
                 Switch between the raw submissions log and the automated{' '}
                 <code className="font-mono text-xs text-slate-800">Slot Matrix</code> sheet
-                tracking missed slots per team member.
+                tracking missed slots per assistant.
               </p>
             </div>
 
@@ -620,7 +824,7 @@ export default function App() {
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  Slot Matrix &amp; Roster
+                  Slot Matrix &amp; Assistants
                 </button>
               </div>
 
@@ -777,21 +981,20 @@ export default function App() {
             </div>
           ) : (
             <div className="rounded-xl border border-slate-200 bg-white overflow-hidden">
-              {/* Roster add bar matching /addmember @username */}
               <form
                 onSubmit={handleAddMember}
                 className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 bg-slate-50/70"
               >
                 <div className="text-xs text-slate-600">
-                  Simulated <code className="font-mono text-slate-800">/addmember</code> roster for{' '}
-                  <span className="font-mono font-semibold text-slate-800">{simDate}</span>
+                  Simulated <code className="font-mono text-slate-800">/addassistant</code> roster
+                  for <span className="font-mono font-semibold text-slate-800">{simDate}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
                     value={newMemberInput}
                     onChange={(e) => setNewMemberInput(e.target.value)}
-                    placeholder="@teammate"
+                    placeholder="@assistant"
                     className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900 focus:border-sky-600 focus:outline-none"
                   />
                   <button
@@ -799,7 +1002,7 @@ export default function App() {
                     className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-                    <span>Add Member</span>
+                    <span>Add Assistant</span>
                   </button>
                 </div>
               </form>
@@ -860,15 +1063,15 @@ export default function App() {
           )}
         </section>
 
-        {/* Section 3: Telegram Bot Commands Reference */}
+        {/* Section 4: Telegram Bot Commands Reference */}
         <section id="commands" className="scroll-mt-20 space-y-4">
           <div>
             <h2 className="text-xl font-bold tracking-tight text-slate-900">
-              03. Built-In Bot Commands
+              04. Built-In Bot Commands
             </h2>
             <p className="text-sm text-slate-600">
-              Manage your team roster, trigger instant Excel exports, and back up your database
-              directly inside Telegram.
+              Toggle reminders live, bind your Database &amp; Work groups, and export Excel files
+              from Telegram.
             </p>
           </div>
 
@@ -897,15 +1100,15 @@ export default function App() {
           </div>
         </section>
 
-        {/* Section 4: Complete Python Deliverables (bot.py + requirements.txt) */}
+        {/* Section 5: Complete Python Deliverables (bot.py + requirements.txt) */}
         <section id="bot-code" className="scroll-mt-20 space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div>
               <h2 className="text-xl font-bold tracking-tight text-slate-900">
-                04. Complete Python Script &amp; Pip Packages
+                05. Complete Python Script &amp; Pip Packages
               </h2>
               <p className="text-sm text-slate-600">
-                Upload only <code className="font-mono text-xs text-slate-800">bot.py</code> and{' '}
+                Upload <code className="font-mono text-xs text-slate-800">bot.py</code> and{' '}
                 <code className="font-mono text-xs text-slate-800">requirements.txt</code> to your
                 GitHub repository.
               </p>
@@ -979,20 +1182,46 @@ export default function App() {
           </div>
         </section>
 
-        {/* Section 5: GitHub + Render Deployment Checklist */}
+        {/* Section 6: Render .env Block & Deployment Checklist */}
         <section id="render-setup" className="scroll-mt-20 space-y-4">
           <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-2">
             <div>
               <h2 className="text-xl font-bold tracking-tight text-slate-900">
-                05. GitHub &amp; Render Free Deployment Guide
+                06. Render Environment Variables &amp; Setup Guide
               </h2>
               <p className="text-sm text-slate-600">
-                Step-by-step deployment using only GitHub and Render (no Google Cloud setup).
+                Paste this block directly into Render&apos;s <strong>Add from .env</strong> modal.
               </p>
             </div>
             <span className="text-xs font-mono text-slate-600 tabular-nums">
               {completedCount} of {SETUP_STEPS.length} steps checked
             </span>
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-slate-950 text-slate-100 overflow-hidden">
+            <div className="flex items-center justify-between border-b border-slate-800 px-4 py-2.5 text-xs text-slate-400">
+              <span className="font-mono">Render .env</span>
+              <button
+                type="button"
+                onClick={() => handleCopy(RENDER_ENV_BLOCK, 'render-env')}
+                className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs font-medium text-slate-200 hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                {copiedTarget === 'render-env' ? (
+                  <>
+                    <Check className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
+                    <span>Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Copy .env</span>
+                  </>
+                )}
+              </button>
+            </div>
+            <pre className="overflow-auto p-4 font-mono text-xs leading-6 text-slate-200">
+              <code>{RENDER_ENV_BLOCK}</code>
+            </pre>
           </div>
 
           <div className="rounded-xl border border-slate-200 bg-white divide-y divide-slate-200">
@@ -1048,7 +1277,7 @@ export default function App() {
 
       <footer className="border-t border-slate-200 bg-white mt-12">
         <div className="mx-auto max-w-7xl px-6 py-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
-          <span>SlotTrack Bot · Telegram Excel Report Automation (GitHub + Render)</span>
+          <span>SlotTrack Bot · Telegram Excel &amp; Live DB Backup Automation</span>
           <div className="flex items-center gap-4">
             <button
               type="button"

@@ -165,6 +165,26 @@ export interface BotCommandInfo {
 
 export const BOT_COMMANDS: BotCommandInfo[] = [
   {
+    command: '/reminder on | off',
+    scope: 'Admin Only',
+    description: 'Turns scheduled assistant-tagging reminders and 5-min warnings ON or OFF live.',
+  },
+  {
+    command: '/setdbgroup',
+    scope: 'Admin (in DB Group)',
+    description: 'Links your private Database Group so reports.db syncs automatically on every submission.',
+  },
+  {
+    command: '/setworkgroup',
+    scope: 'Admin (in Work Group)',
+    description: 'Links your work Telegram group for photo tracking and automated assistant warnings.',
+  },
+  {
+    command: '/addassistant @user',
+    scope: 'Admin Only',
+    description: 'Registers assistants to be tagged in reminders and tracked for missed slots (/addmember alias).',
+  },
+  {
     command: '/excel [YYYY-MM-DD]',
     scope: 'Admin / Group',
     description: 'Generates and sends the 4-sheet .xlsx workbook for today or a specific date.',
@@ -175,31 +195,25 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
     description: 'Sends a 7-day consolidated Excel workbook with Member Compliance %.',
   },
   {
-    command: '/summary',
+    command: '/summary & /mystatus',
     scope: 'Group / DM',
-    description: 'Posts a live text breakdown of On Time vs Late counts per team member.',
-  },
-  {
-    command: '/mystatus',
-    scope: 'Group / DM',
-    description: 'Shows the sender which of the 5 daily slots are Done vs Pending today.',
-  },
-  {
-    command: '/addmember @user',
-    scope: 'Admin Only',
-    description: 'Adds a team member to the roster so missed slots appear in the Slot Matrix sheet.',
-  },
-  {
-    command: '/removemember @user',
-    scope: 'Admin Only',
-    description: 'Removes a team member from missed-slot compliance tracking.',
+    description: 'Shows live On Time vs Late breakdown or an individual member’s 5-slot progress.',
   },
   {
     command: '/backup & /restore',
     scope: 'Admin Only',
-    description: 'Exports reports.db to Telegram or restores it by replying /restore to the file.',
+    description: 'Manual DB export/restore (plus automatic auto-restore from pinned DB group message).',
   },
 ];
+
+export const RENDER_ENV_BLOCK = `TELEGRAM_BOT_TOKEN=1234567890:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ADMIN_CHAT_ID=123456789
+ALLOWED_CHAT_ID=-1001234567890
+DB_BACKUP_CHAT_ID=-1009876543210
+ASSISTANT_TAGS=@arjun_ops,@priya_lead,@sneha_qa
+ENABLE_REMINDERS=true
+PREVENT_DUPLICATE_SLOTS=true
+DB_PATH=reports.db`;
 
 export interface SetupStep {
   id: string;
@@ -215,10 +229,10 @@ export const SETUP_STEPS: SetupStep[] = [
     phase: '01',
     title: 'Create Telegram Bot & Turn Off Group Privacy',
     summary:
-      'Message @BotFather on Telegram, run /newbot to copy your TELEGRAM_BOT_TOKEN, then disable Group Privacy so the bot can detect photo uploads in your team group.',
+      'Message @BotFather on Telegram, run /newbot to copy your TELEGRAM_BOT_TOKEN, and turn Group Privacy off so the bot sees photo reports in your work group.',
     commandsOrNotes: [
       'In @BotFather: /mybots -> Select Bot -> Bot Settings -> Group Privacy -> Turn off',
-      'Add the bot to your work Telegram group. No Google Cloud or credentials.json needed.',
+      'Create 2 Telegram groups: (1) Work Report Group, (2) Private Database Backup Group. Add the bot as Admin in the DB Group so it can pin latest backups.',
     ],
   },
   {
@@ -226,44 +240,42 @@ export const SETUP_STEPS: SetupStep[] = [
     phase: '02',
     title: 'Push bot.py & requirements.txt to GitHub',
     summary:
-      'Create a GitHub repository and upload bot.py and requirements.txt. Keep your bot token strictly inside Render Environment Variables.',
+      'Upload bot.py and requirements.txt to a GitHub repository. Keep tokens inside Render Environment Variables.',
     commandsOrNotes: [
-      'git init && git add bot.py requirements.txt && git commit -m "Add Telegram Excel report bot"',
+      'git init && git add bot.py requirements.txt && git commit -m "Add Telegram Excel & DB sync bot"',
       'git push -u origin main',
     ],
   },
   {
     id: 'step-3',
     phase: '03',
-    title: 'Deploy on Render (Free Web Service)',
+    title: 'Deploy on Render (Free Web Service) & Paste .env',
     summary:
-      'In Render Dashboard, click New -> Web Service, connect your GitHub repo, and set Python build and start commands.',
+      'In Render Dashboard, click New -> Web Service, connect your GitHub repo, set Build/Start commands, and paste the Environment block.',
     commandsOrNotes: [
-      'Build Command: pip install -r requirements.txt',
-      'Start Command: python bot.py',
-      'Required Env Var: TELEGRAM_BOT_TOKEN=<your-botfather-token>',
+      'Build Command: pip install -r requirements.txt  |  Start Command: python bot.py',
+      'Set TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID, ALLOWED_CHAT_ID, DB_BACKUP_CHAT_ID, ASSISTANT_TAGS.',
     ],
   },
   {
     id: 'step-4',
     phase: '04',
-    title: 'Configure ADMIN_CHAT_ID, Group Reminders & Roster',
+    title: 'Link Groups & Toggle Reminders Live Inside Telegram',
     summary:
-      'Send /start in the group and in DM to copy your IDs. Set ADMIN_CHAT_ID (for 8:30 PM IST Excel + DB backup DMs) and ALLOWED_CHAT_ID (enables automatic group reminders at each slot).',
+      'You can also bind groups dynamically by typing /setworkgroup inside your work group and /setdbgroup inside your database group, then toggle reminders anytime with /reminder on or /reminder off.',
     commandsOrNotes: [
-      'ADMIN_CHAT_ID=<your-user-id>  |  ALLOWED_CHAT_ID=<your-group-id>',
-      'Optional flags: ENABLE_REMINDERS=true  |  PREVENT_DUPLICATE_SLOTS=true',
+      '/addassistant @assistant1 @assistant2  -> tags them with warnings at slot open & 5-min cutoff',
+      '/reminder on  |  /reminder off  -> instant live switch saved in SQLite',
     ],
   },
   {
     id: 'step-5',
     phase: '05',
-    title: 'Keep Render Free Tier Awake & Restore Backup Anytime',
+    title: 'Keep Render Free Tier Awake (10-Minute Ping)',
     summary:
-      'Ping your Render URL every 10 minutes using UptimeRobot or cron-job.org so polling never sleeps. If Render restarts and resets disk, reply /restore to the latest Telegram backup file.',
+      'Use UptimeRobot or cron-job.org to ping your Render URL every 10 minutes. Every report submission pushes reports.db to your Database Group and pins it for automatic recovery on Render restarts.',
     commandsOrNotes: [
       'Health URL: https://<your-app-name>.onrender.com/ (returns 200 OK)',
-      'Bot automatically DMs reports_backup_YYYY-MM-DD.db alongside the 8:30 PM Excel report.',
     ],
   },
 ];

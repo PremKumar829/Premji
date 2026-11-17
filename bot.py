@@ -1,17 +1,18 @@
 """
-Telegram Group Photo Report Tracker -> Automatic Excel (.xlsx) Reporter (Pro Edition)
+Telegram Group Photo Report Tracker -> Automatic Excel (.xlsx) & Live DB Group Sync
 Deployable directly via GitHub + Render Free Tier (no Google Sheets / external DB needed).
 
 Features:
-  - Listens to group photo uploads & image documents in IST (Asia/Kolkata)
+  - Tracks group photo uploads & image documents in IST (Asia/Kolkata)
   - Validates 5 daily slots (10 AM, 1 PM, 3 PM, 5 PM, Final before 8 PM) + 15-min grace
-  - Duplicate slot protection (prevents accidental double-logging per slot per day)
-  - Captures optional photo captions in the Excel report
-  - Team roster management (/addmember, /removemember, /team) + auto-registration
-  - Automatic slot reminder alerts in the work group via JobQueue
-  - Interactive commands: /start, /help, /summary, /mystatus, /excel [YYYY-MM-DD], /weekly
-  - Automatic daily Excel (.xlsx) DM to ADMIN_CHAT_ID at 8:30 PM IST (4 styled sheets)
-  - Telegram-based SQLite backup & restore (/backup, /restore) for Render Free Tier
+  - Duplicate slot protection + optional photo caption logging
+  - Sends updated reports.db to a dedicated Database Backup Group on EVERY submission
+  - Auto-restores reports.db from the pinned DB group backup on Render restart (if bot is admin)
+  - Tags assistants with warning alerts at slot start + 5-min final warning for pending members
+  - Live /reminder on | /reminder off toggle persisted in SQLite
+  - Interactive commands: /start, /excel, /weekly, /summary, /mystatus, /reminder,
+    /addmember, /removemember, /team, /setdbgroup, /setworkgroup, /backup, /restore
+  - Automatic daily 4-sheet Excel (.xlsx) DM to ADMIN_CHAT_ID at 8:30 PM IST
 
 Requires: python-telegram-bot[job-queue] >= 21.0, openpyxl >= 3.1.5, python-dotenv, tzdata
 """
@@ -55,15 +56,24 @@ logger = logging.getLogger("excel_report_bot")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# Your personal Telegram numeric User ID so the bot DMs you the daily Excel & backups.
 ADMIN_CHAT_ID_RAW = os.getenv("ADMIN_CHAT_ID", "").strip()
-ADMIN_CHAT_ID: Optional[int] = int(ADMIN_CHAT_ID_RAW) if ADMIN_CHAT_ID_RAW else None
+DEFAULT_ADMIN_CHAT_ID: Optional[int] = int(ADMIN_CHAT_ID_RAW) if ADMIN_CHAT_ID_RAW else None
 
-# Optional: Specific Telegram group chat ID for photo tracking & automated reminders.
 ALLOWED_CHAT_ID_RAW = os.getenv("ALLOWED_CHAT_ID", "").strip()
-ALLOWED_CHAT_ID: Optional[int] = int(ALLOWED_CHAT_ID_RAW) if ALLOWED_CHAT_ID_RAW else None
+DEFAULT_WORK_CHAT_ID: Optional[int] = int(ALLOWED_CHAT_ID_RAW) if ALLOWED_CHAT_ID_RAW else None
 
-ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "true").strip().lower() == "true"
+DB_BACKUP_CHAT_ID_RAW = os.getenv("DB_BACKUP_CHAT_ID", "").strip()
+DEFAULT_DB_BACKUP_CHAT_ID: Optional[int] = (
+    int(DB_BACKUP_CHAT_ID_RAW) if DB_BACKUP_CHAT_ID_RAW else None
+)
+
+# Comma-separated assistant usernames to always tag in reminders (in addition to /addmember)
+ASSISTANT_TAGS_RAW = os.getenv("ASSISTANT_TAGS", "").strip()
+DEFAULT_ASSISTANT_TAGS: list[str] = [
+    tag.strip() for tag in ASSISTANT_TAGS_RAW.split(",") if tag.strip()
+]
+
+DEFAULT_ENABLE_REMINDERS = os.getenv("ENABLE_REMINDERS", "true").strip().lower() == "true"
 PREVENT_DUPLICATE_SLOTS = os.getenv("PREVENT_DUPLICATE_SLOTS", "true").strip().lower() == "true"
 
 DB_PATH = os.getenv("DB_PATH", "reports.db").strip()
@@ -79,39 +89,35 @@ class ReportingSlot:
     label: str
     start: time
     end: time  # Inclusive end of window (includes 15-minute grace period)
-    reminder_time: time  # When the bot nudges the group
+    reminder_time: time  # Slot-open reminder + tag warning
+    final_warning_time: time  # 5-minute warning before grace closes
 
 
 REPORTING_SLOTS: tuple[ReportingSlot, ...] = (
-    ReportingSlot("10:00 AM Slot", time(10, 0, 0), time(10, 15, 59), time(10, 0, 0)),
-    ReportingSlot("1:00 PM Slot", time(13, 0, 0), time(13, 15, 59), time(13, 0, 0)),
-    ReportingSlot("3:00 PM Slot", time(15, 0, 0), time(15, 15, 59), time(15, 0, 0)),
-    ReportingSlot("5:00 PM Slot", time(17, 0, 0), time(17, 15, 59), time(17, 0, 0)),
+    ReportingSlot("10:00 AM Slot", time(10, 0, 0), time(10, 15, 59), time(10, 0, 0), time(10, 10, 0)),
+    ReportingSlot("1:00 PM Slot", time(13, 0, 0), time(13, 15, 59), time(13, 0, 0), time(13, 10, 0)),
+    ReportingSlot("3:00 PM Slot", time(15, 0, 0), time(15, 15, 59), time(15, 0, 0), time(15, 10, 0)),
+    ReportingSlot("5:00 PM Slot", time(17, 0, 0), time(17, 15, 59), time(17, 0, 0), time(17, 10, 0)),
     ReportingSlot(
         "Final Report (Before 8:00 PM)",
         time(19, 30, 0),
         time(20, 15, 59),
         time(19, 45, 0),
+        time(20, 10, 0),
     ),
 )
 
 
 def detect_slot(ist_dt: datetime) -> tuple[str, str]:
-    """
-    Compare an IST-aware datetime against designated reporting slots.
-    Returns (reporting_slot_label, status_label).
-    """
     current_t = ist_dt.time().replace(tzinfo=None)
-
     for slot in REPORTING_SLOTS:
         if slot.start <= current_t <= slot.end:
             return slot.label, "On Time"
-
     return "Late / Outside Slot", "Late / Penalty"
 
 
 # ---------------------------------------------------------------------------
-# SQLite Persistence (Reports + Team Roster)
+# SQLite Persistence (Reports + Team Roster + Bot Settings)
 # ---------------------------------------------------------------------------
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -138,7 +144,40 @@ def init_db() -> None:
             )
             """
         )
-        # Lightweight migration if upgrading from older schema
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        # Seed default settings if absent
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
+            ("reminders_enabled", "true" if DEFAULT_ENABLE_REMINDERS else "false"),
+        )
+        if DEFAULT_WORK_CHAT_ID is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
+                ("work_group_id", str(DEFAULT_WORK_CHAT_ID)),
+            )
+        if DEFAULT_DB_BACKUP_CHAT_ID is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
+                ("db_group_id", str(DEFAULT_DB_BACKUP_CHAT_ID)),
+            )
+
+        # Seed assistants from ASSISTANT_TAGS env var
+        now_iso = datetime.now(IST).isoformat()
+        for tag in DEFAULT_ASSISTANT_TAGS:
+            normalized = tag if tag.startswith("@") else f"@{tag}"
+            conn.execute(
+                "INSERT OR IGNORE INTO team_members (username, added_at) VALUES (?, ?)",
+                (normalized, now_iso),
+            )
+
+        # Schema migration safety for older DB files
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(reports)").fetchall()
         }
@@ -146,7 +185,45 @@ def init_db() -> None:
             conn.execute("ALTER TABLE reports ADD COLUMN user_id INTEGER")
         if "caption" not in existing_cols:
             conn.execute("ALTER TABLE reports ADD COLUMN caption TEXT DEFAULT ''")
+
         conn.commit()
+
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        conn.commit()
+
+
+def is_reminders_enabled() -> bool:
+    val = get_setting("reminders_enabled", "true" if DEFAULT_ENABLE_REMINDERS else "false")
+    return (val or "true").lower() == "true"
+
+
+def get_work_group_id() -> Optional[int]:
+    val = get_setting("work_group_id")
+    if val:
+        return int(val)
+    return DEFAULT_WORK_CHAT_ID
+
+
+def get_db_group_id() -> Optional[int]:
+    val = get_setting("db_group_id")
+    if val:
+        return int(val)
+    return DEFAULT_DB_BACKUP_CHAT_ID
 
 
 def ensure_member_registered(username: str) -> None:
@@ -186,7 +263,6 @@ def get_team_members() -> list[str]:
 
 
 def has_slot_submission(username: str, report_date: str, reporting_slot: str) -> Optional[str]:
-    """Return existing submission time if user already submitted this slot today."""
     if reporting_slot == "Late / Outside Slot":
         return None
     with sqlite3.connect(DB_PATH) as conn:
@@ -199,6 +275,23 @@ def has_slot_submission(username: str, report_date: str, reporting_slot: str) ->
             (username, report_date, reporting_slot),
         ).fetchone()
         return row[0] if row else None
+
+
+def get_pending_assistants_for_slot(report_date: str, slot_label: str) -> list[str]:
+    """Return registered assistants/members who have NOT submitted this slot today."""
+    members = sorted(set(get_team_members()) | set(DEFAULT_ASSISTANT_TAGS))
+    if not members:
+        return []
+    with sqlite3.connect(DB_PATH) as conn:
+        submitted_rows = conn.execute(
+            """
+            SELECT DISTINCT LOWER(username) FROM reports
+            WHERE report_date = ? AND reporting_slot = ?
+            """,
+            (report_date, slot_label),
+        ).fetchall()
+    submitted_set = {r[0] for r in submitted_rows}
+    return [m for m in members if m.lower() not in submitted_set]
 
 
 def save_report_to_db(
@@ -282,10 +375,18 @@ def fetch_user_today_slots(username: str, report_date: str) -> dict[str, str]:
     return {slot: sub_time for slot, sub_time in rows}
 
 
+def count_total_reports() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM reports").fetchone()
+        return int(row[0]) if row else 0
+
+
 # ---------------------------------------------------------------------------
 # Styled Excel (.xlsx) Workbook Builder (4 Sheets)
 # ---------------------------------------------------------------------------
-def _style_sheet(ws, headers: list[str], rows: list[tuple[str, ...]], status_col_idx: Optional[int] = None) -> None:
+def _style_sheet(
+    ws, headers: list[str], rows: list[tuple[str, ...]], status_col_idx: Optional[int] = None
+) -> None:
     header_fill = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True, size=11)
     on_time_fill = PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid")
@@ -319,7 +420,6 @@ def _style_sheet(ws, headers: list[str], rows: list[tuple[str, ...]], status_col
                 status_cell.fill = warn_fill
                 status_cell.font = warn_font
 
-    # Auto-fit column widths
     for col_idx, header in enumerate(headers, start=1):
         max_len = len(header)
         for row in rows:
@@ -330,13 +430,6 @@ def _style_sheet(ws, headers: list[str], rows: list[tuple[str, ...]], status_col
 
 
 def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple[BytesIO, int]:
-    """
-    Generate a 4-sheet .xlsx workbook:
-      1) Target Date (or Last N Days) Submissions
-      2) Member Summary (On Time, Late, Missed Slots, Compliance %)
-      3) Slot Matrix (Each member vs 5 slots: On Time / Missed)
-      4) Full History
-    """
     today_str = target_date or datetime.now(IST).strftime("%Y-%m-%d")
 
     if days > 1:
@@ -370,14 +463,7 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
         missed = max(expected_slots - on_time, 0)
         compliance = round((on_time / expected_slots) * 100) if expected_slots else 0
         summary_rows.append(
-            (
-                member,
-                str(on_time),
-                str(late),
-                str(missed),
-                f"{compliance}%",
-                today_str,
-            )
+            (member, str(on_time), str(late), str(missed), f"{compliance}%", today_str)
         )
 
     _style_sheet(
@@ -395,7 +481,9 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
         late_count = sum(1 for r in target_day_rows if r[0] == member and r[4] == "Late / Penalty")
         row_cells = [member]
         for label in slot_labels:
-            row_cells.append(f"On Time ({member_day_slots[label]})" if label in member_day_slots else "Missed")
+            row_cells.append(
+                f"On Time ({member_day_slots[label]})" if label in member_day_slots else "Missed"
+            )
         row_cells.append(str(late_count))
         matrix_rows.append(tuple(row_cells))
 
@@ -416,12 +504,49 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
 
 
 # ---------------------------------------------------------------------------
+# Database Group Sync Helper
+# ---------------------------------------------------------------------------
+async def push_db_to_backup_group(
+    context: ContextTypes.DEFAULT_TYPE,
+    caption: str,
+) -> None:
+    """Send the updated reports.db to the configured Database Backup Group and pin it."""
+    db_group_id = get_db_group_id()
+    if db_group_id is None or not os.path.exists(DB_PATH):
+        return
+
+    try:
+        with open(DB_PATH, "rb") as db_file:
+            db_bytes = BytesIO(db_file.read())
+        db_bytes.name = "reports.db"
+
+        sent_msg = await context.bot.send_document(
+            chat_id=db_group_id,
+            document=db_bytes,
+            filename="reports.db",
+            caption=caption,
+            disable_notification=True,
+        )
+        # Attempt to pin the latest DB backup silently for auto-recovery on restarts
+        try:
+            await context.bot.pin_chat_message(
+                chat_id=db_group_id,
+                message_id=sent_msg.message_id,
+                disable_notification=True,
+            )
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("Could not push DB backup to group %s: %s", db_group_id, exc)
+
+
+# ---------------------------------------------------------------------------
 # Authorization Helper
 # ---------------------------------------------------------------------------
 def _is_admin(update: Update) -> bool:
-    if ADMIN_CHAT_ID is None or not update.effective_user:
+    if DEFAULT_ADMIN_CHAT_ID is None or not update.effective_user:
         return True
-    return update.effective_user.id == ADMIN_CHAT_ID
+    return update.effective_user.id == DEFAULT_ADMIN_CHAT_ID
 
 
 # ---------------------------------------------------------------------------
@@ -431,26 +556,108 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.message or not update.effective_chat or not update.effective_user:
         return
 
+    rem_status = "ON" if is_reminders_enabled() else "OFF"
+    work_gid = get_work_group_id() or "Not set"
+    db_gid = get_db_group_id() or "Not set"
+
     await update.message.reply_text(
         f"Excel Report Tracker Bot is active.\n"
         f"Your User ID (`ADMIN_CHAT_ID`): `{update.effective_user.id}`\n"
-        f"Current Chat ID (`ALLOWED_CHAT_ID`): `{update.effective_chat.id}`\n\n"
+        f"Current Chat ID: `{update.effective_chat.id}`\n"
+        f"Work Group: `{work_gid}` | DB Group: `{db_gid}`\n"
+        f"Slot Reminders: *{rem_status}*\n\n"
         f"Commands:\n"
+        f"/reminder on | /reminder off - Toggle slot reminders & warnings\n"
+        f"/addmember @user - Add assistant/member to tag & tracking roster\n"
+        f"/removemember @user - Remove member from roster\n"
+        f"/team - View registered assistants\n"
+        f"/setworkgroup - Set current group as Work Report Group\n"
+        f"/setdbgroup - Set current group as Database Backup Group\n"
         f"/excel [YYYY-MM-DD] - Download Excel (.xlsx) report\n"
         f"/weekly - Download 7-day Excel workbook\n"
         f"/summary - Live today summary in chat\n"
-        f"/mystatus - Check your own slots for today\n"
-        f"/addmember @user - Register team member for missed-slot tracking\n"
-        f"/removemember @user - Remove member from roster\n"
-        f"/team - View registered roster\n"
-        f"/backup - Download SQLite DB backup (reply /restore to a backup file to restore)\n"
-        f"Auto-report runs daily at 8:30 PM IST.",
+        f"/mystatus - Check your own slots today\n"
+        f"/backup | /restore - Manual DB backup or restore",
         parse_mode="Markdown",
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start_command(update, context)
+
+
+async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle reminders ON/OFF live via /reminder on | /reminder off."""
+    if not update.message:
+        return
+
+    if not context.args:
+        status = "ON" if is_reminders_enabled() else "OFF"
+        await update.message.reply_text(
+            f"Slot Reminders & Assistant Warnings are currently *{status}*.\n"
+            f"Use `/reminder on` or `/reminder off` to change.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can turn reminders ON or OFF.")
+        return
+
+    arg = context.args[0].strip().lower()
+    if arg in ("on", "enable", "start", "true", "1"):
+        await asyncio.to_thread(set_setting, "reminders_enabled", "true")
+        await update.message.reply_text(
+            "Slot Reminders & Assistant Warnings are now *ON*.\n"
+            "Bot will tag assistants with warnings at each slot and 5 minutes before cutoff.",
+            parse_mode="Markdown",
+        )
+    elif arg in ("off", "disable", "stop", "false", "0"):
+        await asyncio.to_thread(set_setting, "reminders_enabled", "false")
+        await update.message.reply_text(
+            "Slot Reminders & Assistant Warnings are now *OFF*.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "Invalid option. Use `/reminder on` or `/reminder off`.",
+            parse_mode="Markdown",
+        )
+
+
+async def setworkgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can set groups.")
+        return
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("Run `/setworkgroup` inside your Telegram work group.", parse_mode="Markdown")
+        return
+
+    await asyncio.to_thread(set_setting, "work_group_id", str(update.effective_chat.id))
+    await update.message.reply_text(
+        f"This group (`{update.effective_chat.id}`) is now set as the *Work Report Group* for photo tracking & reminders.",
+        parse_mode="Markdown",
+    )
+
+
+async def setdbgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can set groups.")
+        return
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("Run `/setdbgroup` inside your dedicated Database Backup group.", parse_mode="Markdown")
+        return
+
+    await asyncio.to_thread(set_setting, "db_group_id", str(update.effective_chat.id))
+    await update.message.reply_text(
+        f"This group (`{update.effective_chat.id}`) is now set as the *Database Backup Group*.\n"
+        f"Every submitted slot report will automatically sync `reports.db` here.",
+        parse_mode="Markdown",
+    )
 
 
 async def excel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -468,7 +675,9 @@ async def excel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             datetime.strptime(candidate, "%Y-%m-%d")
             target_date = candidate
         except ValueError:
-            await update.message.reply_text("Invalid date format. Use `/excel YYYY-MM-DD`.", parse_mode="Markdown")
+            await update.message.reply_text(
+                "Invalid date format. Use `/excel YYYY-MM-DD`.", parse_mode="Markdown"
+            )
             return
 
     excel_stream, count = await asyncio.to_thread(build_excel_bytes, target_date, 1)
@@ -511,7 +720,11 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     on_time_total = sum(1 for r in rows if r[4] == "On Time")
     late_total = sum(1 for r in rows if r[4] == "Late / Penalty")
 
-    lines = [f"*Daily Summary ({today_str} IST)*", f"On Time: {on_time_total} | Late: {late_total}", ""]
+    lines = [
+        f"*Daily Summary ({today_str} IST)*",
+        f"On Time: {on_time_total} | Late: {late_total}",
+        "",
+    ]
 
     all_names = sorted(set(members) | {r[0] for r in rows})
     if not all_names:
@@ -552,16 +765,17 @@ async def addmember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Only the configured admin can modify the team roster.")
         return
     if not context.args:
-        await update.message.reply_text("Usage: `/addmember @username`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/addmember @assistant1 @assistant2`", parse_mode="Markdown")
         return
 
     added = []
     for raw in context.args:
-        if await asyncio.to_thread(add_team_member, raw):
-            added.append(raw)
+        clean = raw if raw.startswith("@") else f"@{raw}"
+        if await asyncio.to_thread(add_team_member, clean):
+            added.append(clean)
 
     if added:
-        await update.message.reply_text(f"Added to roster: {', '.join(added)}")
+        await update.message.reply_text(f"Added to assistant roster: {', '.join(added)}")
     else:
         await update.message.reply_text("Member(s) already in roster.")
 
@@ -592,9 +806,12 @@ async def team_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     members = await asyncio.to_thread(get_team_members)
     if not members:
-        await update.message.reply_text("Team roster is empty. Use `/addmember @username` or upload a photo.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Assistant roster is empty. Use `/addmember @username` or upload a photo.",
+            parse_mode="Markdown",
+        )
         return
-    await update.message.reply_text("Registered Team Members:\n" + "\n".join(f"- {m}" for m in members))
+    await update.message.reply_text("Registered Assistants / Members:\n" + "\n".join(f"- {m}" for m in members))
 
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -611,7 +828,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_document(
             document=db_file,
             filename="reports.db",
-            caption="SQLite database backup. Reply `/restore` to this file anytime to restore after a Render restart.",
+            caption="SQLite database backup. Reply `/restore` to this file anytime to restore.",
             parse_mode="Markdown",
         )
 
@@ -625,7 +842,9 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     replied = update.message.reply_to_message
     if not replied or not replied.document:
-        await update.message.reply_text("Reply `/restore` directly to a `reports.db` backup file.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Reply `/restore` directly to a `reports.db` backup file.", parse_mode="Markdown"
+        )
         return
 
     tg_file = await replied.document.get_file()
@@ -635,10 +854,10 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ---------------------------------------------------------------------------
-# Scheduled Jobs (Daily Excel + Slot Reminders)
+# Scheduled Jobs (Daily Excel + Tagged Assistant Warnings)
 # ---------------------------------------------------------------------------
 async def send_daily_excel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if ADMIN_CHAT_ID is None:
+    if DEFAULT_ADMIN_CHAT_ID is None:
         logger.warning("ADMIN_CHAT_ID not set; skipping scheduled 8:30 PM IST Excel report.")
         return
 
@@ -647,7 +866,7 @@ async def send_daily_excel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     filename = f"team_report_{today_str}.xlsx"
 
     await context.bot.send_document(
-        chat_id=ADMIN_CHAT_ID,
+        chat_id=DEFAULT_ADMIN_CHAT_ID,
         document=excel_stream,
         filename=filename,
         caption=(
@@ -656,27 +875,67 @@ async def send_daily_excel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         ),
     )
 
-    if os.path.exists(DB_PATH):
-        with open(DB_PATH, "rb") as db_file:
-            await context.bot.send_document(
-                chat_id=ADMIN_CHAT_ID,
-                document=db_file,
-                filename=f"reports_backup_{today_str}.db",
-                caption="Automatic daily database backup.",
-            )
+    await push_db_to_backup_group(
+        context,
+        caption=f"Daily Closing DB Backup | {today_str} | 8:30 PM IST | Total today: {today_count}",
+    )
 
 
-async def send_slot_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ENABLE_REMINDERS or ALLOWED_CHAT_ID is None or not context.job:
+async def send_slot_open_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tag registered assistants with a warning when a reporting slot opens."""
+    if not is_reminders_enabled() or not context.job:
+        return
+
+    work_group_id = get_work_group_id()
+    if work_group_id is None:
         return
 
     slot_label = str(context.job.data)
-    if "Final" in slot_label:
-        msg = "Reminder: Final Report window is open. Upload your photo report before 8:00 PM IST (grace up to 8:15 PM)."
-    else:
-        msg = f"Reminder: {slot_label} is now open. Upload your photo report within 15 minutes."
+    members = await asyncio.to_thread(get_team_members)
+    tags_line = " ".join(members) if members else "@all"
 
-    await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg)
+    if "Final" in slot_label:
+        msg = (
+            f"WARNING & REMINDER: {slot_label} is now OPEN!\n"
+            f"Attention: {tags_line}\n"
+            f"Please upload your photo report before 8:00 PM IST (grace period ends 8:15 PM IST). "
+            f"Submissions after 8:15 PM will be marked Late / Penalty."
+        )
+    else:
+        msg = (
+            f"WARNING & REMINDER: {slot_label} is now OPEN!\n"
+            f"Attention: {tags_line}\n"
+            f"Upload your photo report within 15 minutes to stay On Time. "
+            f"Late uploads will trigger a Penalty mark."
+        )
+
+    await context.bot.send_message(chat_id=work_group_id, text=msg)
+
+
+async def send_slot_final_warning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """5 minutes before grace ends, tag ONLY pending assistants who have not submitted yet."""
+    if not is_reminders_enabled() or not context.job:
+        return
+
+    work_group_id = get_work_group_id()
+    if work_group_id is None:
+        return
+
+    slot_label = str(context.job.data)
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    pending = await asyncio.to_thread(get_pending_assistants_for_slot, today_str, slot_label)
+
+    if not pending:
+        return
+
+    tags_line = " ".join(pending)
+    msg = (
+        f"FINAL WARNING (5 MINUTES LEFT) — {slot_label}\n"
+        f"Pending Assistants: {tags_line}\n"
+        f"Upload your photo report immediately! Grace period closes in 5 minutes, "
+        f"after which your slot will be marked Late / Penalty."
+    )
+    await context.bot.send_message(chat_id=work_group_id, text=msg)
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +949,13 @@ async def handle_photo_report(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not message or not user or not chat:
         return
 
-    if ALLOWED_CHAT_ID is not None and chat.id != ALLOWED_CHAT_ID:
+    # Ignore messages from the dedicated DB backup group
+    db_group_id = get_db_group_id()
+    if db_group_id is not None and chat.id == db_group_id:
+        return
+
+    work_group_id = get_work_group_id()
+    if work_group_id is not None and chat.id != work_group_id:
         logger.debug("Ignored message from non-allowed chat_id=%s", chat.id)
         return
 
@@ -701,7 +966,6 @@ async def handle_photo_report(update: Update, context: ContextTypes.DEFAULT_TYPE
     reporting_slot, status = detect_slot(ist_dt)
     caption = (message.caption or "").strip()
 
-    # Prevent duplicate logging in the same valid slot on the same day
     if PREVENT_DUPLICATE_SLOTS:
         existing_time = await asyncio.to_thread(
             has_slot_submission, username, report_date, reporting_slot
@@ -741,6 +1005,15 @@ async def handle_photo_report(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_to_message_id=message.message_id,
         )
         return
+
+    # Push updated database to the dedicated Database Backup Group on every slot report
+    db_caption = (
+        f"DB Sync | {username} | {reporting_slot}\n"
+        f"Time: {submission_time} | Date: {report_date} | Status: {status}"
+    )
+    if caption:
+        db_caption += f"\nNote: {caption}"
+    await push_db_to_backup_group(context, caption=db_caption)
 
     display_name = user.first_name or username
     note_line = f"\nNote: {caption}" if caption else ""
@@ -785,9 +1058,32 @@ def start_health_server() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Application Entrypoint
+# Startup Auto-Restore & Job Scheduling
 # ---------------------------------------------------------------------------
+async def auto_restore_from_db_group(application: Application) -> None:
+    """If local DB is empty after a Render restart, restore from the pinned message in DB_BACKUP_CHAT_ID."""
+    db_group_id = get_db_group_id()
+    if db_group_id is None:
+        return
+
+    if await asyncio.to_thread(count_total_reports) > 0:
+        return
+
+    try:
+        chat = await application.bot.get_chat(db_group_id)
+        pinned = chat.pinned_message
+        if pinned and pinned.document and pinned.document.file_name == "reports.db":
+            tg_file = await pinned.document.get_file()
+            await tg_file.download_to_drive(custom_path=DB_PATH)
+            await asyncio.to_thread(init_db)
+            logger.info("Auto-restored reports.db from pinned backup in DB group %s", db_group_id)
+    except Exception as exc:
+        logger.warning("Auto-restore skipped: %s", exc)
+
+
 async def post_init(application: Application) -> None:
+    await auto_restore_from_db_group(application)
+
     if application.job_queue is None:
         return
 
@@ -797,18 +1093,25 @@ async def post_init(application: Application) -> None:
         name="daily_excel_report",
     )
 
-    if ENABLE_REMINDERS and ALLOWED_CHAT_ID is not None:
-        for slot in REPORTING_SLOTS:
-            reminder_dt = datetime.combine(datetime.now(IST).date(), slot.reminder_time, tzinfo=IST)
-            application.job_queue.run_daily(
-                send_slot_reminder_job,
-                time=reminder_dt.timetz(),
-                data=slot.label,
-                name=f"reminder_{slot.label}",
-            )
-        logger.info("Scheduled daily Excel report (20:30 IST) and 5 group slot reminders.")
-    else:
-        logger.info("Scheduled daily Excel report at 20:30 IST (set ALLOWED_CHAT_ID for reminders).")
+    today_ist = datetime.now(IST).date()
+    for slot in REPORTING_SLOTS:
+        open_dt = datetime.combine(today_ist, slot.reminder_time, tzinfo=IST)
+        application.job_queue.run_daily(
+            send_slot_open_reminder_job,
+            time=open_dt.timetz(),
+            data=slot.label,
+            name=f"reminder_open_{slot.label}",
+        )
+
+        warn_dt = datetime.combine(today_ist, slot.final_warning_time, tzinfo=IST)
+        application.job_queue.run_daily(
+            send_slot_final_warning_job,
+            time=warn_dt.timetz(),
+            data=slot.label,
+            name=f"reminder_warn_{slot.label}",
+        )
+
+    logger.info("Scheduled daily Excel (20:30 IST), slot-open warnings, and 5-min final warnings.")
 
 
 def main() -> None:
@@ -822,12 +1125,15 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("reminder", reminder_command))
+    application.add_handler(CommandHandler("setworkgroup", setworkgroup_command))
+    application.add_handler(CommandHandler("setdbgroup", setdbgroup_command))
     application.add_handler(CommandHandler(["excel", "report"], excel_command))
     application.add_handler(CommandHandler("weekly", weekly_command))
     application.add_handler(CommandHandler("summary", summary_command))
     application.add_handler(CommandHandler("mystatus", mystatus_command))
-    application.add_handler(CommandHandler("addmember", addmember_command))
-    application.add_handler(CommandHandler("removemember", removemember_command))
+    application.add_handler(CommandHandler(["addmember", "addassistant"], addmember_command))
+    application.add_handler(CommandHandler(["removemember", "removeassistant"], removemember_command))
     application.add_handler(CommandHandler("team", team_command))
     application.add_handler(CommandHandler("backup", backup_command))
     application.add_handler(CommandHandler("restore", restore_command))
