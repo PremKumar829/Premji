@@ -64,10 +64,16 @@ export default function App() {
   const [preventDuplicates, setPreventDuplicates] = useState(true);
   const [duplicateNotice, setDuplicateNotice] = useState<string | null>(null);
 
-  // Reminder ON/OFF & DB Group Sync state
+  // Reminder ON/OFF & Assistant Tag Manager state
   const [remindersEnabled, setRemindersEnabled] = useState(true);
   const [reminderSlotId, setReminderSlotId] = useState('10am');
   const [reminderPreviewMode, setReminderPreviewMode] = useState<ReminderPreviewMode>('open');
+  const [assistantTags, setAssistantTags] = useState<string[]>([
+    '@arjun_ops',
+    '@priya_lead',
+    '@sneha_qa',
+  ]);
+  const [newTagInput, setNewTagInput] = useState('');
 
   // Excel table & roster state
   const [sheetRows, setSheetRows] = useState<SheetRow[]>(INITIAL_SHEET_ROWS);
@@ -156,29 +162,33 @@ export default function App() {
         .filter((r) => r.date === simDate && r.reportingSlot === selectedSlotObj.label)
         .map((r) => r.username.toLowerCase())
     );
-    return teamRoster.filter((m) => !submitted.has(m.toLowerCase()));
-  }, [teamRoster, sheetRows, simDate, selectedSlotObj]);
+    return assistantTags.filter((m) => !submitted.has(m.toLowerCase()));
+  }, [assistantTags, sheetRows, simDate, selectedSlotObj]);
 
   const reminderMessagePreview = useMemo(() => {
     if (!remindersEnabled) {
       return 'Reminders are currently OFF (/reminder off). No slot alerts or assistant tags will be sent to the work group.';
     }
-    const allTags = teamRoster.length ? teamRoster.join(' ') : '@all';
+    const allTags = assistantTags.join(' ');
+    const attentionLine = allTags ? `Attention: ${allTags}\n` : '';
     if (reminderPreviewMode === 'open') {
       if (selectedSlotObj.id === 'final') {
-        return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\nAttention: ${allTags}\nPlease upload your photo report before 8:00 PM IST (grace period ends 8:15 PM IST). Submissions after 8:15 PM will be marked Late / Penalty.`;
+        return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\n${attentionLine}Please upload your photo report before 8:00 PM IST (grace period ends 8:15 PM IST). Submissions after 8:15 PM will be marked Late / Penalty.`;
       }
-      return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\nAttention: ${allTags}\nUpload your photo report within 15 minutes to stay On Time. Late uploads will trigger a Penalty mark.`;
+      return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\n${attentionLine}Upload your photo report within 15 minutes to stay On Time. Late uploads will trigger a Penalty mark.`;
+    }
+    if (assistantTags.length === 0) {
+      return 'No assistants are currently tagged. Use /tags or /settags @user1 @user2 to select who should receive warnings.';
     }
     if (pendingAssistantsForSelectedSlot.length === 0) {
-      return `All registered assistants have already submitted ${selectedSlotObj.label}. No 5-minute final warning needed.`;
+      return `All tagged assistants have already submitted ${selectedSlotObj.label}. No 5-minute final warning needed.`;
     }
     return `FINAL WARNING (5 MINUTES LEFT) — ${selectedSlotObj.label}\nPending Assistants: ${pendingAssistantsForSelectedSlot.join(' ')}\nUpload your photo report immediately! Grace period closes in 5 minutes, after which your slot will be marked Late / Penalty.`;
   }, [
     remindersEnabled,
     reminderPreviewMode,
     selectedSlotObj,
-    teamRoster,
+    assistantTags,
     pendingAssistantsForSelectedSlot,
   ]);
 
@@ -256,6 +266,31 @@ export default function App() {
 
   const handleRemoveMember = (member: string) => {
     setTeamRoster((prev) => prev.filter((m) => m !== member));
+    setAssistantTags((prev) => prev.filter((m) => m.toLowerCase() !== member.toLowerCase()));
+  };
+
+  const handleToggleAssistantTag = (member: string) => {
+    setAssistantTags((prev) => {
+      const exists = prev.some((m) => m.toLowerCase() === member.toLowerCase());
+      if (exists) {
+        return prev.filter((m) => m.toLowerCase() !== member.toLowerCase());
+      }
+      return [...prev, member];
+    });
+  };
+
+  const handleAddAssistantTag = (e: React.FormEvent) => {
+    e.preventDefault();
+    const clean = newTagInput.trim();
+    if (!clean) return;
+    const normalized = clean.startsWith('@') || clean.includes(' ') ? clean : `@${clean}`;
+    if (!assistantTags.some((m) => m.toLowerCase() === normalized.toLowerCase())) {
+      setAssistantTags((prev) => [...prev, normalized]);
+    }
+    if (!teamRoster.some((m) => m.toLowerCase() === normalized.toLowerCase())) {
+      setTeamRoster((prev) => [...prev, normalized]);
+    }
+    setNewTagInput('');
   };
 
   const handleExportCsv = () => {
@@ -738,6 +773,60 @@ export default function App() {
                     5-Min Final Warning
                   </button>
                 </div>
+              </div>
+
+              <div className="space-y-2.5 pt-1">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-slate-700">
+                    In-Bot Assistant Tag Picker (<code className="font-mono">/tags</code>)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setAssistantTags([])}
+                    className="text-xs font-medium text-slate-500 hover:text-red-600 transition-colors cursor-pointer"
+                  >
+                    Clear All Tags
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap gap-1.5">
+                  {Array.from(new Set([...teamRoster, ...assistantTags])).map((member) => {
+                    const isTagged = assistantTags.some(
+                      (t) => t.toLowerCase() === member.toLowerCase()
+                    );
+                    return (
+                      <button
+                        key={member}
+                        type="button"
+                        onClick={() => handleToggleAssistantTag(member)}
+                        className={`rounded-lg border px-2.5 py-1 text-xs font-mono font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                          isTagged
+                            ? 'border-emerald-600 bg-emerald-50 text-emerald-800'
+                            : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'
+                        }`}
+                      >
+                        {isTagged ? `[ON] ${member}` : `[OFF] ${member}`}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <form onSubmit={handleAddAssistantTag} className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={newTagInput}
+                    onChange={(e) => setNewTagInput(e.target.value)}
+                    placeholder="Add tag via /addtag @username"
+                    className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900 focus:border-sky-600 focus:outline-none"
+                  />
+                  <button
+                    type="submit"
+                    className="inline-flex items-center gap-1 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Add Tag</span>
+                  </button>
+                </form>
               </div>
 
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">

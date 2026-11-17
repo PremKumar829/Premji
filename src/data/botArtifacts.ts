@@ -165,6 +165,16 @@ export interface BotCommandInfo {
 
 export const BOT_COMMANDS: BotCommandInfo[] = [
   {
+    command: '/tags (or /assistants)',
+    scope: 'Admin Only',
+    description: 'Opens an interactive button panel in Telegram to toggle which assistants get tagged.',
+  },
+  {
+    command: '/settags @a @b',
+    scope: 'Admin Only',
+    description: 'Sets the exact list of assistants to tag in reminders (/addtag, /removetag, /cleartags).',
+  },
+  {
     command: '/reminder on | off',
     scope: 'Admin Only',
     description: 'Turns scheduled assistant-tagging reminders and 5-min warnings ON or OFF live.',
@@ -178,11 +188,6 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
     command: '/setworkgroup',
     scope: 'Admin (in Work Group)',
     description: 'Links your work Telegram group for photo tracking and automated assistant warnings.',
-  },
-  {
-    command: '/addassistant @user',
-    scope: 'Admin Only',
-    description: 'Registers assistants to be tagged in reminders and tracked for missed slots (/addmember alias).',
   },
   {
     command: '/excel [YYYY-MM-DD]',
@@ -210,7 +215,6 @@ export const RENDER_ENV_BLOCK = `TELEGRAM_BOT_TOKEN=1234567890:AAHxxxxxxxxxxxxxx
 ADMIN_CHAT_ID=123456789
 ALLOWED_CHAT_ID=-1001234567890
 DB_BACKUP_CHAT_ID=-1009876543210
-ASSISTANT_TAGS=@arjun_ops,@priya_lead,@sneha_qa
 ENABLE_REMINDERS=true
 PREVENT_DUPLICATE_SLOTS=true
 DB_PATH=reports.db`;
