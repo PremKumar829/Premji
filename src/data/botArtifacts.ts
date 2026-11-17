@@ -65,8 +65,9 @@ export const REPORTING_SLOTS: ReportingSlot[] = [
 ];
 
 export interface SlotResult {
+  inActiveSlot: boolean;
   reportingSlot: string;
-  status: 'On Time' | 'Late / Penalty';
+  status: 'On Time' | 'Outside Slot (Not Recorded)';
   formattedTimeIst: string;
 }
 
@@ -86,6 +87,7 @@ export function evaluateIstSlot(time24: string): SlotResult {
   for (const slot of REPORTING_SLOTS) {
     if (currentSec >= slot.startSec && currentSec <= slot.endSec) {
       return {
+        inActiveSlot: true,
         reportingSlot: slot.label,
         status: 'On Time',
         formattedTimeIst,
@@ -94,8 +96,9 @@ export function evaluateIstSlot(time24: string): SlotResult {
   }
 
   return {
-    reportingSlot: 'Late / Outside Slot',
-    status: 'Late / Penalty',
+    inActiveSlot: false,
+    reportingSlot: 'Outside Slot Window',
+    status: 'Outside Slot (Not Recorded)',
     formattedTimeIst,
   };
 }
@@ -106,7 +109,7 @@ export interface SheetRow {
   submissionTime: string;
   reportingSlot: string;
   date: string;
-  status: 'On Time' | 'Late / Penalty';
+  status: 'On Time';
   caption: string;
 }
 
@@ -131,15 +134,6 @@ export const INITIAL_SHEET_ROWS: SheetRow[] = [
   },
   {
     id: 'row-3',
-    username: 'Rohan Mehta',
-    submissionTime: '03:22:09 PM IST',
-    reportingSlot: 'Late / Outside Slot',
-    date: '2026-11-17',
-    status: 'Late / Penalty',
-    caption: 'Network issue delay',
-  },
-  {
-    id: 'row-4',
     username: '@sneha_qa',
     submissionTime: '07:54:31 PM IST',
     reportingSlot: 'Final Report (Before 8:00 PM)',
@@ -152,7 +146,6 @@ export const INITIAL_SHEET_ROWS: SheetRow[] = [
 export const INITIAL_TEAM_ROSTER: string[] = [
   '@arjun_ops',
   '@priya_lead',
-  'Rohan Mehta',
   '@sneha_qa',
   '@vikram_dev',
 ];
@@ -167,7 +160,7 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
   {
     command: '/tags (or /assistants)',
     scope: 'Admin Only',
-    description: 'Opens an interactive button panel in Telegram to toggle which assistants get tagged.',
+    description: 'Opens an interactive button panel in Telegram to toggle which auto-detected assistants get tagged.',
   },
   {
     command: '/settags @a @b',
@@ -180,14 +173,14 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
     description: 'Turns scheduled assistant-tagging reminders and 5-min warnings ON or OFF live.',
   },
   {
-    command: '/setdbgroup',
-    scope: 'Admin (in DB Group)',
-    description: 'Links your private Database Group so reports.db syncs automatically on every submission.',
+    command: '/setexcelgroup',
+    scope: 'Admin (in Excel Group)',
+    description: 'Links your Excel Report Group so team_report_YYYY-MM-DD.xlsx is sent on every slot submission.',
   },
   {
     command: '/setworkgroup',
     scope: 'Admin (in Work Group)',
-    description: 'Links your work Telegram group for photo tracking and automated assistant warnings.',
+    description: 'Links your work Telegram group for auto assistant discovery, slot recording, and warnings.',
   },
   {
     command: '/excel [YYYY-MM-DD]',
@@ -202,19 +195,19 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
   {
     command: '/summary & /mystatus',
     scope: 'Group / DM',
-    description: 'Shows live On Time vs Late breakdown or an individual member’s 5-slot progress.',
+    description: 'Shows live slot submission counts or an individual assistant’s 5-slot progress.',
   },
   {
-    command: '/backup & /restore',
+    command: '/restore',
     scope: 'Admin Only',
-    description: 'Manual DB export/restore (plus automatic auto-restore from pinned DB group message).',
+    description: 'Reply /restore to any .xlsx file to restore history (plus auto-restore from pinned .xlsx on boot).',
   },
 ];
 
 export const RENDER_ENV_BLOCK = `TELEGRAM_BOT_TOKEN=1234567890:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ADMIN_CHAT_ID=123456789
 ALLOWED_CHAT_ID=-1001234567890
-DB_BACKUP_CHAT_ID=-1009876543210
+EXCEL_GROUP_ID=-1009876543210
 ENABLE_REMINDERS=true
 PREVENT_DUPLICATE_SLOTS=true
 DB_PATH=reports.db`;
@@ -233,10 +226,10 @@ export const SETUP_STEPS: SetupStep[] = [
     phase: '01',
     title: 'Create Telegram Bot & Turn Off Group Privacy',
     summary:
-      'Message @BotFather on Telegram, run /newbot to copy your TELEGRAM_BOT_TOKEN, and turn Group Privacy off so the bot sees photo reports in your work group.',
+      'Message @BotFather on Telegram, run /newbot to copy your TELEGRAM_BOT_TOKEN, and turn Group Privacy off so the bot sees all messages and photo uploads in your work group.',
     commandsOrNotes: [
       'In @BotFather: /mybots -> Select Bot -> Bot Settings -> Group Privacy -> Turn off',
-      'Create 2 Telegram groups: (1) Work Report Group, (2) Private Database Backup Group. Add the bot as Admin in the DB Group so it can pin latest backups.',
+      'Add the bot to your Work Group and your Excel Report Group (make it Admin in the Excel Group so it can pin latest .xlsx files).',
     ],
   },
   {
@@ -244,9 +237,9 @@ export const SETUP_STEPS: SetupStep[] = [
     phase: '02',
     title: 'Push bot.py & requirements.txt to GitHub',
     summary:
-      'Upload bot.py and requirements.txt to a GitHub repository. Keep tokens inside Render Environment Variables.',
+      'Upload bot.py and requirements.txt to your GitHub repository. Keep tokens inside Render Environment Variables.',
     commandsOrNotes: [
-      'git init && git add bot.py requirements.txt && git commit -m "Add Telegram Excel & DB sync bot"',
+      'git init && git add bot.py requirements.txt && git commit -m "Excel-only auto-assistant Telegram bot"',
       'git push -u origin main',
     ],
   },
@@ -258,18 +251,18 @@ export const SETUP_STEPS: SetupStep[] = [
       'In Render Dashboard, click New -> Web Service, connect your GitHub repo, set Build/Start commands, and paste the Environment block.',
     commandsOrNotes: [
       'Build Command: pip install -r requirements.txt  |  Start Command: python bot.py',
-      'Set TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID, ALLOWED_CHAT_ID, DB_BACKUP_CHAT_ID, ASSISTANT_TAGS.',
+      'Set TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID, ALLOWED_CHAT_ID, EXCEL_GROUP_ID.',
     ],
   },
   {
     id: 'step-4',
     phase: '04',
-    title: 'Link Groups & Toggle Reminders Live Inside Telegram',
+    title: 'Auto-Discover Assistants & Manage Tags with /tags',
     summary:
-      'You can also bind groups dynamically by typing /setworkgroup inside your work group and /setdbgroup inside your database group, then toggle reminders anytime with /reminder on or /reminder off.',
+      'Whenever any assistant sends any message in the work group, the bot automatically recognizes them. Use /tags to toggle who gets tagged or /reminder on|off anytime.',
     commandsOrNotes: [
-      '/addassistant @assistant1 @assistant2  -> tags them with warnings at slot open & 5-min cutoff',
-      '/reminder on  |  /reminder off  -> instant live switch saved in SQLite',
+      '/setworkgroup (in Work Group)  |  /setexcelgroup (in Excel Report Group)',
+      '/tags -> tap buttons to enable/disable tagging  |  /reminder on | off',
     ],
   },
   {
@@ -277,7 +270,7 @@ export const SETUP_STEPS: SetupStep[] = [
     phase: '05',
     title: 'Keep Render Free Tier Awake (10-Minute Ping)',
     summary:
-      'Use UptimeRobot or cron-job.org to ping your Render URL every 10 minutes. Every report submission pushes reports.db to your Database Group and pins it for automatic recovery on Render restarts.',
+      'Ping your Render URL every 10 minutes via UptimeRobot or cron-job.org. Every slot submission sends an updated .xlsx Excel file and pins it for automatic restart recovery.',
     commandsOrNotes: [
       'Health URL: https://<your-app-name>.onrender.com/ (returns 200 OK)',
     ],

@@ -7,10 +7,10 @@ import {
   CheckCircle2,
   Clock,
   Copy,
-  Database,
   Download,
   FileCode2,
   FileSpreadsheet,
+  MessageSquarePlus,
   Plus,
   RotateCcw,
   Search,
@@ -33,22 +33,21 @@ import {
 
 type CodeTab = 'bot.py' | 'requirements.txt';
 type PreviewTab = 'log' | 'matrix';
-type StatusFilter = 'all' | 'on_time' | 'late';
 type ReminderPreviewMode = 'open' | 'final_warning';
 
 const TIME_PRESETS = [
-  { label: '10:08 AM', value: '10:08:24' },
+  { label: '10:08 AM (Slot)', value: '10:08:24' },
   { label: '10:15 AM (Grace)', value: '10:15:45' },
-  { label: '10:16 AM (Late)', value: '10:16:05' },
-  { label: '1:05 PM', value: '13:05:12' },
+  { label: '10:16 AM (Closed)', value: '10:16:05' },
+  { label: '1:05 PM (Slot)', value: '13:05:12' },
   { label: '3:15 PM (Grace)', value: '15:15:30' },
-  { label: '5:10 PM', value: '17:10:00' },
-  { label: '7:50 PM (Final)', value: '19:50:18' },
+  { label: '5:10 PM (Slot)', value: '17:10:00' },
+  { label: '7:41 PM (Final)', value: '19:41:10' },
   { label: '8:14 PM (Grace)', value: '20:14:30' },
-  { label: '8:18 PM (Late)', value: '20:18:10' },
+  { label: '8:18 PM (Closed)', value: '20:18:10' },
 ];
 
-const CHECKLIST_STORAGE_KEY = 'slottrack_excel_render_checklist_v3';
+const CHECKLIST_STORAGE_KEY = 'slottrack_excel_only_checklist_v4';
 
 export default function App() {
   const [activeCodeTab, setActiveCodeTab] = useState<CodeTab>('bot.py');
@@ -58,11 +57,14 @@ export default function App() {
   // Simulator state
   const [simUsername, setSimUsername] = useState('@vikram_dev');
   const [simFirstName, setSimFirstName] = useState('Vikram');
-  const [simTime24, setSimTime24] = useState('10:08:24');
+  const [simTime24, setSimTime24] = useState('19:41:10');
   const [simDate, setSimDate] = useState('2026-11-17');
-  const [simCaption, setSimCaption] = useState('Morning site update');
+  const [simCaption, setSimCaption] = useState('Evening closing photo');
   const [preventDuplicates, setPreventDuplicates] = useState(true);
-  const [duplicateNotice, setDuplicateNotice] = useState<string | null>(null);
+  const [simFeedback, setSimFeedback] = useState<{
+    type: 'recorded' | 'ignored' | 'discovered';
+    text: string;
+  } | null>(null);
 
   // Reminder ON/OFF & Assistant Tag Manager state
   const [remindersEnabled, setRemindersEnabled] = useState(true);
@@ -79,7 +81,7 @@ export default function App() {
   const [sheetRows, setSheetRows] = useState<SheetRow[]>(INITIAL_SHEET_ROWS);
   const [teamRoster, setTeamRoster] = useState<string[]>(INITIAL_TEAM_ROSTER);
   const [newMemberInput, setNewMemberInput] = useState('');
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [slotFilter, setSlotFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
 
   // Setup checklist state persisted locally
@@ -104,8 +106,7 @@ export default function App() {
 
   const filteredRows = useMemo(() => {
     return sheetRows.filter((row) => {
-      if (statusFilter === 'on_time' && row.status !== 'On Time') return false;
-      if (statusFilter === 'late' && row.status !== 'Late / Penalty') return false;
+      if (slotFilter !== 'all' && row.reportingSlot !== slotFilter) return false;
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
         return (
@@ -117,18 +118,12 @@ export default function App() {
       }
       return true;
     });
-  }, [sheetRows, statusFilter, searchQuery]);
-
-  const onTimeCount = useMemo(
-    () => sheetRows.filter((r) => r.status === 'On Time').length,
-    [sheetRows]
-  );
-  const lateCount = sheetRows.length - onTimeCount;
+  }, [sheetRows, slotFilter, searchQuery]);
 
   // Build live Slot Matrix matching Sheet 3 in bot.py
   const matrixData = useMemo(() => {
     const allMembers = Array.from(
-      new Set([...teamRoster, ...sheetRows.map((r) => r.username)])
+      new Set([...teamRoster, ...assistantTags, ...sheetRows.map((r) => r.username)])
     ).sort((a, b) => a.localeCompare(b));
 
     return allMembers.map((member) => {
@@ -140,19 +135,16 @@ export default function App() {
         return match ? match.submissionTime.replace(' IST', '') : null;
       });
       const onTimeSlots = slotStates.filter(Boolean).length;
-      const lateUploads = memberRows.filter((r) => r.status === 'Late / Penalty').length;
       const compliance = Math.round((onTimeSlots / REPORTING_SLOTS.length) * 100);
       return {
         member,
         slotStates,
         onTimeSlots,
-        lateUploads,
         compliance,
       };
     });
-  }, [teamRoster, sheetRows, simDate]);
+  }, [teamRoster, assistantTags, sheetRows, simDate]);
 
-  // Live preview of tagged assistant reminder message
   const selectedSlotObj =
     REPORTING_SLOTS.find((s) => s.id === reminderSlotId) ?? REPORTING_SLOTS[0];
 
@@ -173,9 +165,9 @@ export default function App() {
     const attentionLine = allTags ? `Attention: ${allTags}\n` : '';
     if (reminderPreviewMode === 'open') {
       if (selectedSlotObj.id === 'final') {
-        return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\n${attentionLine}Please upload your photo report before 8:00 PM IST (grace period ends 8:15 PM IST). Submissions after 8:15 PM will be marked Late / Penalty.`;
+        return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\n${attentionLine}Please upload your photo report before 8:00 PM IST (grace period ends 8:15 PM IST). Reports are ONLY recorded during active slot hours.`;
       }
-      return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\n${attentionLine}Upload your photo report within 15 minutes to stay On Time. Late uploads will trigger a Penalty mark.`;
+      return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\n${attentionLine}Upload your photo report within 15 minutes. Reports outside slot hours will NOT be recorded.`;
     }
     if (assistantTags.length === 0) {
       return 'No assistants are currently tagged. Use /tags or /settags @user1 @user2 to select who should receive warnings.';
@@ -183,7 +175,7 @@ export default function App() {
     if (pendingAssistantsForSelectedSlot.length === 0) {
       return `All tagged assistants have already submitted ${selectedSlotObj.label}. No 5-minute final warning needed.`;
     }
-    return `FINAL WARNING (5 MINUTES LEFT) — ${selectedSlotObj.label}\nPending Assistants: ${pendingAssistantsForSelectedSlot.join(' ')}\nUpload your photo report immediately! Grace period closes in 5 minutes, after which your slot will be marked Late / Penalty.`;
+    return `FINAL WARNING (5 MINUTES LEFT) — ${selectedSlotObj.label}\nPending Assistants: ${pendingAssistantsForSelectedSlot.join(' ')}\nUpload your photo report immediately! Slot closes in 5 minutes and will NOT record late uploads.`;
   }, [
     remindersEnabled,
     reminderPreviewMode,
@@ -192,7 +184,7 @@ export default function App() {
     pendingAssistantsForSelectedSlot,
   ]);
 
-  const latestDbSyncRow = sheetRows[0] ?? INITIAL_SHEET_ROWS[0];
+  const latestRow = sheetRows[0] ?? INITIAL_SHEET_ROWS[0];
 
   const handleCopy = async (text: string, id: string) => {
     try {
@@ -216,12 +208,46 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  const autoDiscoverUser = (cleanUser: string): boolean => {
+    let wasNew = false;
+    if (!teamRoster.some((m) => m.toLowerCase() === cleanUser.toLowerCase())) {
+      setTeamRoster((prev) => [...prev, cleanUser]);
+      wasNew = true;
+    }
+    if (!assistantTags.some((m) => m.toLowerCase() === cleanUser.toLowerCase())) {
+      setAssistantTags((prev) => [...prev, cleanUser]);
+      wasNew = true;
+    }
+    return wasNew;
+  };
+
+  const handleSimulateAnyMessage = () => {
+    const cleanUser = simUsername.trim() || simFirstName.trim() || 'Team Member';
+    const newlyAdded = autoDiscoverUser(cleanUser);
+    setSimFeedback({
+      type: 'discovered',
+      text: newlyAdded
+        ? `Auto-discovered ${cleanUser} from group message! Added to Excel Roster and /tags Assistant list.`
+        : `${cleanUser} is already recognized in the Assistant Roster.`,
+    });
+  };
+
   const handleSimulateUpload = (e: React.FormEvent) => {
     e.preventDefault();
     const cleanUser = simUsername.trim() || simFirstName.trim() || 'Team Member';
     const targetDate = simDate || '2026-11-17';
 
-    if (preventDuplicates && liveEvaluation.reportingSlot !== 'Late / Outside Slot') {
+    autoDiscoverUser(cleanUser);
+
+    if (!liveEvaluation.inActiveSlot) {
+      setSimFeedback({
+        type: 'ignored',
+        text: `Not recorded (${liveEvaluation.formattedTimeIst}): Reports are ONLY recorded during active slot windows. Assistant was still auto-recognized.`,
+      });
+      return;
+    }
+
+    if (preventDuplicates) {
       const existing = sheetRows.find(
         (r) =>
           r.username.toLowerCase() === cleanUser.toLowerCase() &&
@@ -229,28 +255,28 @@ export default function App() {
           r.reportingSlot === liveEvaluation.reportingSlot
       );
       if (existing) {
-        setDuplicateNotice(
-          `Duplicate skipped for ${cleanUser}: ${liveEvaluation.reportingSlot} was already recorded today at ${existing.submissionTime}.`
-        );
+        setSimFeedback({
+          type: 'ignored',
+          text: `Duplicate skipped for ${cleanUser}: ${liveEvaluation.reportingSlot} was already recorded today at ${existing.submissionTime}.`,
+        });
         return;
       }
     }
 
-    setDuplicateNotice(null);
     const newRow: SheetRow = {
       id: `row-${Date.now()}`,
       username: cleanUser,
       submissionTime: liveEvaluation.formattedTimeIst,
       reportingSlot: liveEvaluation.reportingSlot,
       date: targetDate,
-      status: liveEvaluation.status,
+      status: 'On Time',
       caption: simCaption.trim(),
     };
     setSheetRows((prev) => [newRow, ...prev]);
-
-    if (!teamRoster.some((m) => m.toLowerCase() === cleanUser.toLowerCase())) {
-      setTeamRoster((prev) => [...prev, cleanUser]);
-    }
+    setSimFeedback({
+      type: 'recorded',
+      text: `Recorded in ${liveEvaluation.reportingSlot} and pushed updated team_report_${targetDate}.xlsx to Excel Group.`,
+    });
   };
 
   const handleAddMember = (e: React.FormEvent) => {
@@ -258,9 +284,7 @@ export default function App() {
     const clean = newMemberInput.trim();
     if (!clean) return;
     const normalized = clean.startsWith('@') || clean.includes(' ') ? clean : `@${clean}`;
-    if (!teamRoster.some((m) => m.toLowerCase() === normalized.toLowerCase())) {
-      setTeamRoster((prev) => [...prev, normalized]);
-    }
+    autoDiscoverUser(normalized);
     setNewMemberInput('');
   };
 
@@ -284,12 +308,7 @@ export default function App() {
     const clean = newTagInput.trim();
     if (!clean) return;
     const normalized = clean.startsWith('@') || clean.includes(' ') ? clean : `@${clean}`;
-    if (!assistantTags.some((m) => m.toLowerCase() === normalized.toLowerCase())) {
-      setAssistantTags((prev) => [...prev, normalized]);
-    }
-    if (!teamRoster.some((m) => m.toLowerCase() === normalized.toLowerCase())) {
-      setTeamRoster((prev) => [...prev, normalized]);
-    }
+    autoDiscoverUser(normalized);
     setNewTagInput('');
   };
 
@@ -337,16 +356,16 @@ export default function App() {
               Slot Simulator
             </a>
             <a
-              href="#reminders-db"
+              href="#reminders-excel"
               className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
             >
-              Warnings &amp; DB Sync
+              Tags &amp; Excel Sync
             </a>
             <a
               href="#excel-preview"
               className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
             >
-              Excel &amp; Matrix
+              Excel Preview
             </a>
             <a
               href="#bot-code"
@@ -380,32 +399,30 @@ export default function App() {
         <section className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
           <div className="lg:col-span-7 space-y-4">
             <p className="text-xs font-medium text-slate-500">
-              GitHub + Render Free · Live DB Group Sync · Assistant Tag Warnings · /reminder on | off
+              Excel-Only (.xlsx) Output · Auto-Recognize Assistants · Strict Slot-Time Recording
             </p>
             <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-slate-900 [text-wrap:balance]">
-              Telegram Photo Report Bot with Live DB Group Sync &amp; Assistant Warning Alerts
+              Telegram Excel-Only Report Bot with Auto Assistant Detection
             </h1>
             <p className="text-base leading-relaxed text-slate-600 max-w-2xl">
-              Every time a photo report is submitted for a slot, the bot saves it and immediately
-              pushes <code className="font-mono text-sm text-slate-800">reports.db</code> to your
-              dedicated Database Group. Built-in slot reminders tag registered assistants with
-              warnings and can be switched ON or OFF anytime via{' '}
-              <code className="font-mono text-sm text-slate-800">/reminder on</code> /{' '}
-              <code className="font-mono text-sm text-slate-800">/reminder off</code>.
+              As soon as any assistant sends any message in your work group, the bot automatically
+              recognizes them. Photo reports are recorded <strong>strictly during slot windows</strong>{' '}
+              and pushed directly as a formatted{' '}
+              <code className="font-mono text-sm text-slate-800">.xlsx</code> Excel file (no raw{' '}
+              <code className="font-mono text-sm text-slate-800">.db</code> files sent to your
+              group).
             </p>
             <div className="pt-2 flex flex-wrap items-center gap-6 text-sm text-slate-700">
               <div>
-                <span className="text-slate-500">DB Sync:</span>{' '}
-                <span className="font-mono font-medium">Per Slot Submission</span>
+                <span className="text-slate-500">Group Output:</span>{' '}
+                <span className="font-mono font-medium">.xlsx Excel Only</span>
               </div>
               <span className="text-slate-300" aria-hidden="true">
                 |
               </span>
               <div>
-                <span className="text-slate-500">Excel Delivery:</span>{' '}
-                <span className="font-mono text-xs font-medium">
-                  8:30 PM IST Auto-DM + /excel
-                </span>
+                <span className="text-slate-500">Off-Slot Uploads:</span>{' '}
+                <span className="font-mono text-xs font-medium">Ignored (Not Recorded)</span>
               </div>
             </div>
           </div>
@@ -414,9 +431,9 @@ export default function App() {
           <div className="lg:col-span-5 rounded-xl border border-slate-200 bg-white p-5">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100">
               <h2 className="text-sm font-semibold text-slate-900">
-                Designated IST Windows &amp; Warnings
+                Active Slot Recording Windows (IST)
               </h2>
-              <span className="text-xs font-mono text-slate-500">+15m grace</span>
+              <span className="text-xs font-mono text-slate-500">Strict mode</span>
             </div>
             <div className="divide-y divide-slate-100">
               {REPORTING_SLOTS.map((slot) => (
@@ -434,15 +451,15 @@ export default function App() {
           </div>
         </section>
 
-        {/* Section 1: Interactive IST Slot Simulator & Duplicate Check */}
+        {/* Section 1: Interactive IST Slot & Auto-Discovery Simulator */}
         <section id="simulator" className="scroll-mt-20 space-y-4">
           <div>
             <h2 className="text-xl font-bold tracking-tight text-slate-900">
-              01. IST Slot, Caption &amp; Duplicate Guard Simulator
+              01. Strict Slot-Time &amp; Auto Assistant Discovery Simulator
             </h2>
             <p className="text-sm text-slate-600">
-              Simulate a group photo upload to test IST slot classification and instant DB Group
-              sync.
+              Test how any group message auto-registers an assistant, while photo reports are only
+              logged during active slot windows.
             </p>
           </div>
 
@@ -499,7 +516,10 @@ export default function App() {
                     type="time"
                     step="1"
                     value={simTime24}
-                    onChange={(e) => setSimTime24(e.target.value || '10:00:00')}
+                    onChange={(e) => {
+                      setSimTime24(e.target.value || '10:00:00');
+                      setSimFeedback(null);
+                    }}
                     className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm text-slate-900 focus:border-sky-600 focus:outline-none"
                   />
                 </div>
@@ -547,7 +567,7 @@ export default function App() {
                         type="button"
                         onClick={() => {
                           setSimTime24(preset.value);
-                          setDuplicateNotice(null);
+                          setSimFeedback(null);
                         }}
                         className={`rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                           isActive
@@ -562,27 +582,38 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="pt-2 flex flex-wrap items-center justify-between gap-4 border-t border-slate-100">
+              <div className="pt-2 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100">
                 <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={preventDuplicates}
                     onChange={(e) => {
                       setPreventDuplicates(e.target.checked);
-                      setDuplicateNotice(null);
+                      setSimFeedback(null);
                     }}
                     className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-600"
                   />
-                  <span>Prevent duplicate submission in same slot</span>
+                  <span>Prevent duplicate slot entry</span>
                 </label>
 
-                <button
-                  type="submit"
-                  className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  <Send className="h-4 w-4" aria-hidden="true" />
-                  <span>Simulate Photo Upload</span>
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSimulateAnyMessage}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <MessageSquarePlus className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Send Any Group Msg</span>
+                  </button>
+
+                  <button
+                    type="submit"
+                    className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Send className="h-4 w-4" aria-hidden="true" />
+                    <span>Upload Slot Photo</span>
+                  </button>
+                </div>
               </div>
             </form>
 
@@ -595,36 +626,22 @@ export default function App() {
                   </span>
                   <span
                     className={`inline-flex items-center gap-1.5 text-xs font-semibold ${
-                      duplicateNotice
-                        ? 'text-amber-700'
-                        : liveEvaluation.status === 'On Time'
-                          ? 'text-emerald-700'
-                          : 'text-red-600'
+                      liveEvaluation.inActiveSlot ? 'text-emerald-700' : 'text-amber-700'
                     }`}
                   >
-                    {duplicateNotice ? (
-                      <>
-                        <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
-                        <span>Duplicate Skipped</span>
-                      </>
-                    ) : liveEvaluation.status === 'On Time' ? (
-                      <>
-                        <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
-                        <span>{liveEvaluation.status}</span>
-                      </>
+                    {liveEvaluation.inActiveSlot ? (
+                      <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
                     ) : (
-                      <>
-                        <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
-                        <span>{liveEvaluation.status}</span>
-                      </>
+                      <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
                     )}
+                    <span>{liveEvaluation.status}</span>
                   </span>
                 </div>
 
                 <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-3">
                   <div className="text-xs text-slate-500 border-b border-slate-200 pb-2 flex items-center justify-between">
                     <span>
-                      Photo from{' '}
+                      Sender:{' '}
                       <span className="font-semibold text-slate-800">
                         {simFirstName.trim() || 'User'}
                       </span>{' '}
@@ -636,25 +653,17 @@ export default function App() {
                   </div>
 
                   <pre className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-slate-800">
-                    {duplicateNotice
-                      ? duplicateNotice
-                      : liveEvaluation.status === 'On Time'
+                    {simFeedback
+                      ? simFeedback.text
+                      : liveEvaluation.inActiveSlot
                         ? `Report recorded for ${simFirstName.trim() || simUsername} (${
                             simUsername.trim() || 'Unknown User'
                           }).\nSlot: ${liveEvaluation.reportingSlot}\nTime: ${
                             liveEvaluation.formattedTimeIst
-                          } | Date: ${simDate}\nStatus: ${liveEvaluation.status}${
+                          } | Date: ${simDate}\nStatus: On Time${
                             simCaption.trim() ? `\nNote: ${simCaption.trim()}` : ''
                           }`
-                        : `Report recorded for ${simFirstName.trim() || simUsername} (${
-                            simUsername.trim() || 'Unknown User'
-                          }), outside scheduled windows.\nSlot: ${
-                            liveEvaluation.reportingSlot
-                          }\nTime: ${
-                            liveEvaluation.formattedTimeIst
-                          } | Date: ${simDate}\nStatus: ${liveEvaluation.status}${
-                            simCaption.trim() ? `\nNote: ${simCaption.trim()}` : ''
-                          }`}
+                        : `Not recorded (${liveEvaluation.formattedTimeIst}): Reports are ONLY recorded during slot windows.\nActive IST Slots: 10:00-10:15 AM, 1:00-1:15 PM, 3:00-3:15 PM, 5:00-5:15 PM, and 7:30-8:15 PM.`}
                   </pre>
                 </div>
               </div>
@@ -662,29 +671,30 @@ export default function App() {
               <div className="text-xs text-slate-500 pt-2 border-t border-slate-100 flex items-center gap-2">
                 <Clock className="h-3.5 w-3.5 text-slate-400 shrink-0" aria-hidden="true" />
                 <span>
-                  Also pushes <code className="font-mono text-slate-700">reports.db</code> to DB
-                  Backup Group immediately.
+                  On valid slot uploads, bot sends{' '}
+                  <code className="font-mono text-slate-700">team_report_{simDate}.xlsx</code>{' '}
+                  immediately.
                 </span>
               </div>
             </div>
           </div>
         </section>
 
-        {/* Section 2: Assistant Tagging Warnings (/reminder on|off) & Live DB Group Sync */}
-        <section id="reminders-db" className="scroll-mt-20 space-y-4">
+        {/* Section 2: Assistant Tagging Warnings (/reminder on|off) & Excel-Only Group Sync */}
+        <section id="reminders-excel" className="scroll-mt-20 space-y-4">
           <div>
             <h2 className="text-xl font-bold tracking-tight text-slate-900">
-              02. Assistant Tagging Warnings &amp; Database Group Sync
+              02. Auto-Discovered Assistant Tags &amp; Excel-Only Group Sync
             </h2>
             <p className="text-sm text-slate-600">
-              Preview live <code className="font-mono text-xs">/reminder on | off</code> behavior
-              and the automatic <code className="font-mono text-xs">reports.db</code> push sent on
-              every slot report.
+              Toggle <code className="font-mono text-xs">/tags</code> and{' '}
+              <code className="font-mono text-xs">/reminder on | off</code>, and preview the exact{' '}
+              <code className="font-mono text-xs">.xlsx</code> attachment pushed to your Excel
+              group.
             </p>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-            {/* Reminder Control & Assistant Tag Warning Preview */}
             <div className="lg:col-span-7 rounded-xl border border-slate-200 bg-white p-6 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-4 pb-3 border-b border-slate-100">
                 <div className="flex items-center gap-2">
@@ -836,42 +846,43 @@ export default function App() {
               </div>
             </div>
 
-            {/* Live Database Backup Group Sync Card */}
+            {/* Excel-Only Group Sync Card */}
             <div className="lg:col-span-5 rounded-xl border border-slate-200 bg-white p-6 flex flex-col justify-between space-y-4">
               <div className="space-y-3">
                 <div className="flex items-center justify-between pb-3 border-b border-slate-100">
                   <div className="flex items-center gap-2">
-                    <Database className="h-4 w-4 text-sky-600" aria-hidden="true" />
+                    <FileSpreadsheet className="h-4 w-4 text-emerald-600" aria-hidden="true" />
                     <span className="text-sm font-semibold text-slate-900">
-                      DB Backup Group Dispatch
+                      Excel-Only Group Dispatch
                     </span>
                   </div>
-                  <span className="text-xs font-mono text-slate-500">Per Report</span>
+                  <span className="text-xs font-mono text-slate-500">Per Slot Report</span>
                 </div>
 
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Whenever a report is saved in the work group, the bot sends the updated{' '}
-                  <code className="font-mono text-slate-800">reports.db</code> file to your
-                  Database Backup Group (<code className="font-mono">DB_BACKUP_CHAT_ID</code>) and
-                  silently pins it for auto-restore on Render restarts.
+                  No raw <code className="font-mono text-slate-800">.db</code> files are sent to
+                  your group. Every valid slot submission sends the updated{' '}
+                  <code className="font-mono text-slate-800">.xlsx</code> workbook directly to your
+                  Excel Group (<code className="font-mono">EXCEL_GROUP_ID</code>) and pins it for
+                  automatic Render restart recovery.
                 </p>
 
                 <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-2">
                   <div className="flex items-center justify-between text-xs font-mono text-slate-700 border-b border-slate-200 pb-2">
-                    <span>Attachment: reports.db</span>
-                    <span>Auto-Pinned</span>
+                    <span>team_report_{latestRow.date}.xlsx</span>
+                    <span>4 Sheets</span>
                   </div>
                   <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-slate-800">
-                    {`DB Sync | ${latestDbSyncRow.username} | ${latestDbSyncRow.reportingSlot}\nTime: ${latestDbSyncRow.submissionTime} | Date: ${latestDbSyncRow.date} | Status: ${latestDbSyncRow.status}${
-                      latestDbSyncRow.caption ? `\nNote: ${latestDbSyncRow.caption}` : ''
+                    {`Excel Updated | ${latestRow.username} | ${latestRow.reportingSlot}\nTime: ${latestRow.submissionTime} | Date: ${latestRow.date} | Status: ${latestRow.status}${
+                      latestRow.caption ? `\nNote: ${latestRow.caption}` : ''
                     }`}
                   </pre>
                 </div>
               </div>
 
               <div className="text-xs text-slate-500 pt-2 border-t border-slate-100">
-                Link anytime by typing <code className="font-mono text-slate-700">/setdbgroup</code>{' '}
-                inside your database group.
+                Bind your Excel group anytime by typing{' '}
+                <code className="font-mono text-slate-700">/setexcelgroup</code> inside it.
               </div>
             </div>
           </div>
@@ -885,9 +896,10 @@ export default function App() {
                 03. Excel Workbook (.xlsx) &amp; Assistant Compliance Matrix
               </h2>
               <p className="text-sm text-slate-600">
-                Switch between the raw submissions log and the automated{' '}
-                <code className="font-mono text-xs text-slate-800">Slot Matrix</code> sheet
-                tracking missed slots per assistant.
+                Preview of the{' '}
+                <code className="font-mono text-xs text-slate-800">Reports</code> and{' '}
+                <code className="font-mono text-xs text-slate-800">Slot Matrix</code> sheets
+                generated inside <code className="font-mono text-xs">.xlsx</code>.
               </p>
             </div>
 
@@ -932,42 +944,20 @@ export default function App() {
           {activePreviewTab === 'log' ? (
             <div className="rounded-xl border border-slate-200 bg-white overflow-hidden">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 bg-slate-50/70">
-                <div className="flex flex-wrap items-center gap-3">
-                  <div className="inline-flex items-center gap-1 rounded-lg bg-slate-200/70 p-1">
-                    <button
-                      type="button"
-                      onClick={() => setStatusFilter('all')}
-                      className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                        statusFilter === 'all'
-                          ? 'bg-white text-slate-900 shadow-xs'
-                          : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      All ({sheetRows.length})
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setStatusFilter('on_time')}
-                      className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                        statusFilter === 'on_time'
-                          ? 'bg-white text-slate-900 shadow-xs'
-                          : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      On Time ({onTimeCount})
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setStatusFilter('late')}
-                      className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                        statusFilter === 'late'
-                          ? 'bg-white text-slate-900 shadow-xs'
-                          : 'text-slate-600 hover:text-slate-900'
-                      }`}
-                    >
-                      Late ({lateCount})
-                    </button>
-                  </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={slotFilter}
+                    onChange={(e) => setSlotFilter(e.target.value)}
+                    aria-label="Filter by reporting slot"
+                    className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 focus:border-sky-600 focus:outline-none"
+                  >
+                    <option value="all">All Slots ({sheetRows.length})</option>
+                    {REPORTING_SLOTS.map((s) => (
+                      <option key={s.id} value={s.label}>
+                        {s.label}
+                      </option>
+                    ))}
+                  </select>
 
                   <button
                     type="button"
@@ -1000,14 +990,14 @@ export default function App() {
                 <div className="px-6 py-12 text-center space-y-3">
                   <p className="text-sm font-medium text-slate-700">
                     {sheetRows.length === 0
-                      ? 'No report rows logged yet.'
+                      ? 'No slot submissions recorded yet.'
                       : 'No rows match the active filter.'}
                   </p>
                   <button
                     type="button"
                     onClick={() => {
                       setSheetRows(INITIAL_SHEET_ROWS);
-                      setStatusFilter('all');
+                      setSlotFilter('all');
                       setSearchQuery('');
                     }}
                     className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
@@ -1045,16 +1035,8 @@ export default function App() {
                             {row.date}
                           </td>
                           <td className="px-4 py-2.5 whitespace-nowrap">
-                            <span
-                              className={`inline-flex items-center gap-1.5 text-xs font-semibold ${
-                                row.status === 'On Time' ? 'text-emerald-700' : 'text-red-600'
-                              }`}
-                            >
-                              {row.status === 'On Time' ? (
-                                <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
-                              ) : (
-                                <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
-                              )}
+                            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700">
+                              <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
                               <span>{row.status}</span>
                             </span>
                           </td>
@@ -1075,8 +1057,8 @@ export default function App() {
                 className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 bg-slate-50/70"
               >
                 <div className="text-xs text-slate-600">
-                  Simulated <code className="font-mono text-slate-800">/addassistant</code> roster
-                  for <span className="font-mono font-semibold text-slate-800">{simDate}</span>
+                  Auto-discovered &amp; manual roster for{' '}
+                  <span className="font-mono font-semibold text-slate-800">{simDate}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <input
@@ -1106,7 +1088,6 @@ export default function App() {
                           {s.shortLabel}
                         </th>
                       ))}
-                      <th className="px-3 py-2.5 text-right">Late</th>
                       <th className="px-3 py-2.5 text-right">Compliance</th>
                       <th className="px-3 py-2.5 text-right">Roster</th>
                     </tr>
@@ -1126,9 +1107,6 @@ export default function App() {
                             )}
                           </td>
                         ))}
-                        <td className="px-3 py-2.5 font-mono text-right tabular-nums text-slate-700">
-                          {row.lateUploads}
-                        </td>
                         <td className="px-3 py-2.5 font-mono text-right tabular-nums font-semibold text-slate-900">
                           {row.compliance}%
                         </td>
@@ -1159,8 +1137,8 @@ export default function App() {
               04. Built-In Bot Commands
             </h2>
             <p className="text-sm text-slate-600">
-              Toggle reminders live, bind your Database &amp; Work groups, and export Excel files
-              from Telegram.
+              Manage assistant tags, toggle reminders live, bind your Excel group, and export
+              reports from Telegram.
             </p>
           </div>
 
@@ -1366,7 +1344,7 @@ export default function App() {
 
       <footer className="border-t border-slate-200 bg-white mt-12">
         <div className="mx-auto max-w-7xl px-6 py-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
-          <span>SlotTrack Bot · Telegram Excel &amp; Live DB Backup Automation</span>
+          <span>SlotTrack Bot · Telegram Excel-Only Report Automation</span>
           <div className="flex items-center gap-4">
             <button
               type="button"

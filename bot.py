@@ -1,18 +1,20 @@
 """
-Telegram Group Photo Report Tracker -> Automatic Excel (.xlsx) & Live DB Group Sync
+Telegram Group Photo Report Tracker -> Excel-Only (.xlsx) + Auto Assistant Discovery
 Deployable directly via GitHub + Render Free Tier (no Google Sheets / external DB needed).
 
-Features:
-  - Tracks group photo uploads & image documents in IST (Asia/Kolkata)
-  - Validates 5 daily slots (10 AM, 1 PM, 3 PM, 5 PM, Final before 8 PM) + 15-min grace
-  - Duplicate slot protection + optional photo caption logging
-  - Sends updated reports.db to a dedicated Database Backup Group on EVERY submission
-  - Auto-restores reports.db from the pinned DB group backup on Render restart (if bot is admin)
-  - In-bot Assistant Tag Manager: choose exactly which assistants to tag via
-    /tags (interactive buttons), /settags @a @b, /addtag @a, /removetag @a, /cleartags
-  - Tags ONLY selected assistants with warning alerts at slot open & 5-min final warning
-  - Live /reminder on | /reminder off toggle persisted in SQLite
-  - Automatic daily 4-sheet Excel (.xlsx) DM to ADMIN_CHAT_ID at 8:30 PM IST
+Core Behavior:
+  1. Excel-Only Delivery: Sends formatted .xlsx workbook (team_report_YYYY-MM-DD.xlsx)
+     to your Excel/Backup Group on every recorded slot submission AND at 8:30 PM IST to Admin DM.
+  2. Auto-Recognize Assistants: When any non-admin member sends ANY message in the work group
+     (or joins), the bot automatically registers them as an assistant and enables tagging
+     (unless manually turned OFF via /tags or /removetag).
+  3. Strict Slot-Time Recording: Photo reports are ONLY recorded during the 5 active IST slot
+     windows (+15 min grace). Uploads outside slot hours are NOT logged to Excel.
+  4. In-Bot Controls: /tags (interactive buttons), /settags, /addtag, /removetag,
+     /reminder on | off, /excel [YYYY-MM-DD], /weekly, /summary, /mystatus,
+     /setworkgroup, /setexcelgroup.
+  5. Auto-Restore on Render Restart: Reads the pinned .xlsx file's "All History" sheet
+     from Telegram if local storage resets.
 
 Requires: python-telegram-bot[job-queue] >= 21.0, openpyxl >= 3.1.5, python-dotenv, tzdata
 """
@@ -30,7 +32,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -63,12 +65,10 @@ DEFAULT_ADMIN_CHAT_ID: Optional[int] = int(ADMIN_CHAT_ID_RAW) if ADMIN_CHAT_ID_R
 ALLOWED_CHAT_ID_RAW = os.getenv("ALLOWED_CHAT_ID", "").strip()
 DEFAULT_WORK_CHAT_ID: Optional[int] = int(ALLOWED_CHAT_ID_RAW) if ALLOWED_CHAT_ID_RAW else None
 
-DB_BACKUP_CHAT_ID_RAW = os.getenv("DB_BACKUP_CHAT_ID", "").strip()
-DEFAULT_DB_BACKUP_CHAT_ID: Optional[int] = (
-    int(DB_BACKUP_CHAT_ID_RAW) if DB_BACKUP_CHAT_ID_RAW else None
-)
+# Supports either EXCEL_GROUP_ID or DB_BACKUP_CHAT_ID env var
+EXCEL_GROUP_ID_RAW = (os.getenv("EXCEL_GROUP_ID") or os.getenv("DB_BACKUP_CHAT_ID") or "").strip()
+DEFAULT_EXCEL_GROUP_ID: Optional[int] = int(EXCEL_GROUP_ID_RAW) if EXCEL_GROUP_ID_RAW else None
 
-# Optional initial assistant tags; manage anytime inside Telegram using /tags or /settags
 ASSISTANT_TAGS_RAW = os.getenv("ASSISTANT_TAGS", "").strip()
 DEFAULT_ASSISTANT_TAGS: list[str] = [
     tag.strip() for tag in ASSISTANT_TAGS_RAW.split(",") if tag.strip()
@@ -109,12 +109,16 @@ REPORTING_SLOTS: tuple[ReportingSlot, ...] = (
 )
 
 
-def detect_slot(ist_dt: datetime) -> tuple[str, str]:
+def detect_active_slot(ist_dt: datetime) -> Optional[str]:
+    """
+    Return the matching slot label ONLY if ist_dt is inside an active slot window.
+    Returns None if outside all designated slots.
+    """
     current_t = ist_dt.time().replace(tzinfo=None)
     for slot in REPORTING_SLOTS:
         if slot.start <= current_t <= slot.end:
-            return slot.label, "On Time"
-    return "Late / Outside Slot", "Late / Penalty"
+            return slot.label
+    return None
 
 
 def _normalize_tag(raw: str) -> str:
@@ -156,6 +160,7 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS assistant_tags (
                 username TEXT PRIMARY KEY,
+                is_active INTEGER NOT NULL DEFAULT 1,
                 added_at TEXT NOT NULL
             )
             """
@@ -168,6 +173,22 @@ def init_db() -> None:
             )
             """
         )
+
+        # Lightweight schema migrations
+        tag_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(assistant_tags)").fetchall()
+        }
+        if "is_active" not in tag_cols:
+            conn.execute("ALTER TABLE assistant_tags ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+
+        report_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(reports)").fetchall()
+        }
+        if "user_id" not in report_cols:
+            conn.execute("ALTER TABLE reports ADD COLUMN user_id INTEGER")
+        if "caption" not in report_cols:
+            conn.execute("ALTER TABLE reports ADD COLUMN caption TEXT DEFAULT ''")
+
         conn.execute(
             "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
             ("reminders_enabled", "true" if DEFAULT_ENABLE_REMINDERS else "false"),
@@ -177,13 +198,12 @@ def init_db() -> None:
                 "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
                 ("work_group_id", str(DEFAULT_WORK_CHAT_ID)),
             )
-        if DEFAULT_DB_BACKUP_CHAT_ID is not None:
+        if DEFAULT_EXCEL_GROUP_ID is not None:
             conn.execute(
                 "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
-                ("db_group_id", str(DEFAULT_DB_BACKUP_CHAT_ID)),
+                ("excel_group_id", str(DEFAULT_EXCEL_GROUP_ID)),
             )
 
-        # Seed initial assistant tags from env var only if assistant_tags table is empty
         existing_tags = conn.execute("SELECT COUNT(*) FROM assistant_tags").fetchone()[0]
         if existing_tags == 0 and DEFAULT_ASSISTANT_TAGS:
             now_iso = datetime.now(IST).isoformat()
@@ -191,21 +211,13 @@ def init_db() -> None:
                 norm = _normalize_tag(tag)
                 if norm:
                     conn.execute(
-                        "INSERT OR IGNORE INTO assistant_tags (username, added_at) VALUES (?, ?)",
+                        "INSERT OR IGNORE INTO assistant_tags (username, is_active, added_at) VALUES (?, 1, ?)",
                         (norm, now_iso),
                     )
                     conn.execute(
                         "INSERT OR IGNORE INTO team_members (username, added_at) VALUES (?, ?)",
                         (norm, now_iso),
                     )
-
-        existing_cols = {
-            row[1] for row in conn.execute("PRAGMA table_info(reports)").fetchall()
-        }
-        if "user_id" not in existing_cols:
-            conn.execute("ALTER TABLE reports ADD COLUMN user_id INTEGER")
-        if "caption" not in existing_cols:
-            conn.execute("ALTER TABLE reports ADD COLUMN caption TEXT DEFAULT ''")
 
         conn.commit()
 
@@ -238,18 +250,32 @@ def get_work_group_id() -> Optional[int]:
     return int(val) if val else DEFAULT_WORK_CHAT_ID
 
 
-def get_db_group_id() -> Optional[int]:
-    val = get_setting("db_group_id")
-    return int(val) if val else DEFAULT_DB_BACKUP_CHAT_ID
+def get_excel_group_id() -> Optional[int]:
+    val = get_setting("excel_group_id") or get_setting("db_group_id")
+    return int(val) if val else DEFAULT_EXCEL_GROUP_ID
 
 
-def ensure_member_registered(username: str) -> None:
+def auto_discover_assistant(username: str) -> bool:
+    """
+    Automatically register any non-admin group member as an assistant on their first message.
+    Uses INSERT OR IGNORE so if admin later toggles them OFF (is_active=0), it is respected.
+    Returns True if newly discovered.
+    """
+    clean = username.strip()
+    if not clean:
+        return False
+    now_iso = datetime.now(IST).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO team_members (username, added_at) VALUES (?, ?)",
-            (username, datetime.now(IST).isoformat()),
+            (clean, now_iso),
+        )
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO assistant_tags (username, is_active, added_at) VALUES (?, 1, ?)",
+            (clean, now_iso),
         )
         conn.commit()
+        return cur.rowcount > 0
 
 
 def add_team_member(username: str) -> bool:
@@ -280,10 +306,11 @@ def get_team_members() -> list[str]:
         return [r[0] for r in rows]
 
 
-# --- Assistant Tag CRUD (Controlled Inside Telegram) ---
 def get_tagged_assistants() -> list[str]:
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT username FROM assistant_tags ORDER BY username ASC").fetchall()
+        rows = conn.execute(
+            "SELECT username FROM assistant_tags WHERE is_active = 1 ORDER BY username ASC"
+        ).fetchall()
         return [r[0] for r in rows]
 
 
@@ -293,8 +320,11 @@ def add_assistant_tag(username: str) -> bool:
         return False
     now_iso = datetime.now(IST).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO assistant_tags (username, added_at) VALUES (?, ?)",
+        conn.execute(
+            """
+            INSERT INTO assistant_tags (username, is_active, added_at) VALUES (?, 1, ?)
+            ON CONFLICT(username) DO UPDATE SET is_active = 1
+            """,
             (norm, now_iso),
         )
         conn.execute(
@@ -302,14 +332,17 @@ def add_assistant_tag(username: str) -> bool:
             (norm, now_iso),
         )
         conn.commit()
-        return cur.rowcount > 0
+        return True
 
 
 def remove_assistant_tag(username: str) -> bool:
     norm = _normalize_tag(username)
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "DELETE FROM assistant_tags WHERE LOWER(username) = LOWER(?) OR LOWER(username) = LOWER(?)",
+            """
+            UPDATE assistant_tags SET is_active = 0
+            WHERE LOWER(username) = LOWER(?) OR LOWER(username) = LOWER(?)
+            """,
             (username.strip(), norm),
         )
         conn.commit()
@@ -327,10 +360,13 @@ def replace_assistant_tags(usernames: list[str]) -> list[str]:
             cleaned.append(norm)
 
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM assistant_tags")
+        conn.execute("UPDATE assistant_tags SET is_active = 0")
         for norm in cleaned:
             conn.execute(
-                "INSERT INTO assistant_tags (username, added_at) VALUES (?, ?)",
+                """
+                INSERT INTO assistant_tags (username, is_active, added_at) VALUES (?, 1, ?)
+                ON CONFLICT(username) DO UPDATE SET is_active = 1
+                """,
                 (norm, now_iso),
             )
             conn.execute(
@@ -343,12 +379,11 @@ def replace_assistant_tags(usernames: list[str]) -> list[str]:
 
 def clear_assistant_tags() -> None:
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM assistant_tags")
+        conn.execute("UPDATE assistant_tags SET is_active = 0")
         conn.commit()
 
 
 def toggle_assistant_tag(username: str) -> bool:
-    """Toggle an assistant in assistant_tags. Returns True if now tagged, False if untagged."""
     tagged_lower = {u.lower() for u in get_tagged_assistants()}
     if username.lower() in tagged_lower:
         remove_assistant_tag(username)
@@ -358,8 +393,6 @@ def toggle_assistant_tag(username: str) -> bool:
 
 
 def has_slot_submission(username: str, report_date: str, reporting_slot: str) -> Optional[str]:
-    if reporting_slot == "Late / Outside Slot":
-        return None
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             """
@@ -373,7 +406,6 @@ def has_slot_submission(username: str, report_date: str, reporting_slot: str) ->
 
 
 def get_pending_tagged_assistants_for_slot(report_date: str, slot_label: str) -> list[str]:
-    """Return ONLY selected assistant tags who have NOT submitted this slot today."""
     tagged = get_tagged_assistants()
     if not tagged:
         return []
@@ -418,7 +450,7 @@ def save_report_to_db(
             ),
         )
         conn.commit()
-    ensure_member_registered(username)
+    auto_discover_assistant(username)
 
 
 def fetch_reports(
@@ -477,7 +509,7 @@ def count_total_reports() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Styled Excel (.xlsx) Workbook Builder (4 Sheets)
+# Styled Excel (.xlsx) Workbook Builder (4 Sheets) & Restore Parser
 # ---------------------------------------------------------------------------
 def _style_sheet(
     ws, headers: list[str], rows: list[tuple[str, ...]], status_col_idx: Optional[int] = None
@@ -488,8 +520,6 @@ def _style_sheet(
     on_time_font = Font(color="166534", bold=True)
     late_fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
     late_font = Font(color="991B1B", bold=True)
-    warn_fill = PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
-    warn_font = Font(color="92400E", bold=True)
 
     ws.append(headers)
     for col_idx in range(1, len(headers) + 1):
@@ -511,9 +541,6 @@ def _style_sheet(
             elif status_val in ("Late / Penalty", "Missed"):
                 status_cell.fill = late_fill
                 status_cell.font = late_font
-            elif status_val.startswith("0%") or status_val.startswith("20%") or status_val.startswith("40%"):
-                status_cell.fill = warn_fill
-                status_cell.font = warn_font
 
     for col_idx, header in enumerate(headers, start=1):
         max_len = len(header)
@@ -551,17 +578,16 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
     for member in members:
         member_rows = [r for r in period_rows if r[0] == member]
         on_time = sum(1 for r in member_rows if r[4] == "On Time")
-        late = sum(1 for r in member_rows if r[4] == "Late / Penalty")
         expected_slots = len(slot_labels) * days
         missed = max(expected_slots - on_time, 0)
         compliance = round((on_time / expected_slots) * 100) if expected_slots else 0
         summary_rows.append(
-            (member, str(on_time), str(late), str(missed), f"{compliance}%", today_str)
+            (member, str(on_time), str(missed), f"{compliance}%", today_str)
         )
 
     _style_sheet(
         ws_summary,
-        ["Username", "On Time", "Late / Penalty", "Missed Slots", "Compliance %", "Reference Date"],
+        ["Username", "Submitted On Time", "Missed Slots", "Compliance %", "Reference Date"],
         summary_rows,
     )
 
@@ -570,18 +596,16 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
     matrix_rows: list[tuple[str, ...]] = []
     for member in members:
         member_day_slots = {r[2]: r[1] for r in target_day_rows if r[0] == member}
-        late_count = sum(1 for r in target_day_rows if r[0] == member and r[4] == "Late / Penalty")
         row_cells = [member]
         for label in slot_labels:
             row_cells.append(
                 f"On Time ({member_day_slots[label]})" if label in member_day_slots else "Missed"
             )
-        row_cells.append(str(late_count))
         matrix_rows.append(tuple(row_cells))
 
     _style_sheet(
         ws_matrix,
-        ["Username", "10:00 AM", "1:00 PM", "3:00 PM", "5:00 PM", "Final (<8 PM)", "Late Uploads"],
+        ["Username", "10:00 AM", "1:00 PM", "3:00 PM", "5:00 PM", "Final (<8 PM)"],
         matrix_rows,
     )
 
@@ -594,36 +618,89 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
     return output, len(period_rows)
 
 
+def restore_from_excel_bytes(excel_bytes: bytes) -> int:
+    """Restore reports & team roster from the 'All History' sheet of a .xlsx backup."""
+    wb = load_workbook(filename=BytesIO(excel_bytes), read_only=True)
+    sheet_name = "All History" if "All History" in wb.sheetnames else wb.sheetnames[0]
+    ws = wb[sheet_name]
+
+    restored = 0
+    now_iso = datetime.now(IST).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        for idx, row in enumerate(ws.iter_rows(values_only=True)):
+            if idx == 0 or not row or not row[0]:
+                continue
+            username = str(row[0]).strip()
+            sub_time = str(row[1] or "").strip()
+            slot_label = str(row[2] or "").strip()
+            rep_date = str(row[3] or "").strip()
+            status = str(row[4] or "On Time").strip()
+            caption = str(row[5] or "").strip() if len(row) > 5 else ""
+
+            exists = conn.execute(
+                """
+                SELECT 1 FROM reports
+                WHERE LOWER(username) = LOWER(?) AND report_date = ? AND reporting_slot = ?
+                LIMIT 1
+                """,
+                (username, rep_date, slot_label),
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    """
+                    INSERT INTO reports (
+                        user_id, username, submission_time, reporting_slot, report_date, status, caption, created_at_utc
+                    ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (username, sub_time, slot_label, rep_date, status, caption, now_iso),
+                )
+                restored += 1
+
+            conn.execute(
+                "INSERT OR IGNORE INTO team_members (username, added_at) VALUES (?, ?)",
+                (username, now_iso),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO assistant_tags (username, is_active, added_at) VALUES (?, 1, ?)",
+                (username, now_iso),
+            )
+        conn.commit()
+    return restored
+
+
 # ---------------------------------------------------------------------------
-# Database Group Sync Helper
+# Excel Group Push Helper (Sends ONLY .xlsx Excel File)
 # ---------------------------------------------------------------------------
-async def push_db_to_backup_group(context: ContextTypes.DEFAULT_TYPE, caption: str) -> None:
-    db_group_id = get_db_group_id()
-    if db_group_id is None or not os.path.exists(DB_PATH):
+async def push_excel_to_group(
+    context: ContextTypes.DEFAULT_TYPE,
+    target_date: str,
+    caption: str,
+) -> None:
+    excel_group_id = get_excel_group_id()
+    if excel_group_id is None:
         return
 
     try:
-        with open(DB_PATH, "rb") as db_file:
-            db_bytes = BytesIO(db_file.read())
-        db_bytes.name = "reports.db"
+        excel_stream, _count = await asyncio.to_thread(build_excel_bytes, target_date, 1)
+        filename = f"team_report_{target_date}.xlsx"
 
         sent_msg = await context.bot.send_document(
-            chat_id=db_group_id,
-            document=db_bytes,
-            filename="reports.db",
+            chat_id=excel_group_id,
+            document=excel_stream,
+            filename=filename,
             caption=caption,
             disable_notification=True,
         )
         try:
             await context.bot.pin_chat_message(
-                chat_id=db_group_id,
+                chat_id=excel_group_id,
                 message_id=sent_msg.message_id,
                 disable_notification=True,
             )
         except Exception:
             pass
     except Exception as exc:
-        logger.warning("Could not push DB backup to group %s: %s", db_group_id, exc)
+        logger.warning("Could not push Excel file to group %s: %s", excel_group_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -640,9 +717,8 @@ def _build_tags_panel() -> tuple[str, InlineKeyboardMarkup]:
         f"*Assistant Tag Manager*\n"
         f"Reminders Status: *{'ON' if rem_on else 'OFF'}*\n"
         f"Currently Tagged ({len(tagged)}): {tagged_str}\n\n"
-        f"Tap any member below to toggle tagging, or type:\n"
-        f"`/settags @user1 @user2` — Set exact list\n"
-        f"`/addtag @user` | `/removetag @user` | `/cleartags`"
+        f"Assistants are auto-discovered when they send any message in the group.\n"
+        f"Tap below to toggle tagging, or use `/settags @user1 @user2`:"
     )
 
     keyboard: list[list[InlineKeyboardButton]] = []
@@ -687,24 +763,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     rem_status = "ON" if is_reminders_enabled() else "OFF"
     work_gid = get_work_group_id() or "Not set"
-    db_gid = get_db_group_id() or "Not set"
+    excel_gid = get_excel_group_id() or "Not set"
     tagged_count = len(get_tagged_assistants())
 
     await update.message.reply_text(
         f"Excel Report Tracker Bot is active.\n"
         f"Your User ID (`ADMIN_CHAT_ID`): `{update.effective_user.id}`\n"
         f"Current Chat ID: `{update.effective_chat.id}`\n"
-        f"Work Group: `{work_gid}` | DB Group: `{db_gid}`\n"
+        f"Work Group: `{work_gid}` | Excel Group: `{excel_gid}`\n"
         f"Slot Reminders: *{rem_status}* | Tagged Assistants: *{tagged_count}*\n\n"
         f"Assistant Tag Controls:\n"
-        f"/tags - Open interactive button panel to pick assistants\n"
+        f"/tags - Open interactive button panel\n"
         f"/settags @a @b - Set exact assistants to tag\n"
         f"/addtag @a | /removetag @a | /cleartags\n"
         f"/reminder on | /reminder off - Toggle reminder warnings\n\n"
-        f"Reports & Setup:\n"
-        f"/setworkgroup | /setdbgroup - Link groups directly\n"
-        f"/excel [YYYY-MM-DD] | /weekly | /summary | /mystatus\n"
-        f"/backup | /restore",
+        f"Excel & Group Setup:\n"
+        f"/setworkgroup | /setexcelgroup - Link groups directly\n"
+        f"/excel [YYYY-MM-DD] | /weekly | /summary | /mystatus",
         parse_mode="Markdown",
     )
 
@@ -714,7 +789,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Open interactive Assistant Tag Manager right inside Telegram."""
     if not update.message:
         return
     if not _is_admin(update):
@@ -726,7 +800,6 @@ async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def settags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Replace the tagged assistants list: /settags @user1 @user2"""
     if not update.message:
         return
     if not _is_admin(update):
@@ -752,7 +825,9 @@ async def addtag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Only the configured admin can modify assistant tags.")
         return
     if not context.args:
-        await update.message.reply_text("Usage: `/addtag @assistant1 @assistant2`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Usage: `/addtag @assistant1 @assistant2`", parse_mode="Markdown"
+        )
         return
 
     raw_items = [part for arg in context.args for part in arg.split(",") if part.strip()]
@@ -763,12 +838,9 @@ async def addtag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             added.append(norm)
 
     tagged = await asyncio.to_thread(get_tagged_assistants)
-    if added:
-        await update.message.reply_text(
-            f"Added to assistant tags: {', '.join(added)}\nActive tags: {', '.join(tagged)}"
-        )
-    else:
-        await update.message.reply_text(f"Already tagged. Active tags: {', '.join(tagged) or 'None'}")
+    await update.message.reply_text(
+        f"Updated assistant tags ({len(tagged)}): {', '.join(tagged) or 'None'}"
+    )
 
 
 async def removetag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -802,7 +874,10 @@ async def cleartags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Only the configured admin can clear assistant tags.")
         return
     await asyncio.to_thread(clear_assistant_tags)
-    await update.message.reply_text("All assistant tags cleared. Use `/tags` or `/settags @user` to add again.", parse_mode="Markdown")
+    await update.message.reply_text(
+        "All assistant tags cleared. Use `/tags` or `/settags @user` to add again.",
+        parse_mode="Markdown",
+    )
 
 
 async def tags_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -892,7 +967,7 @@ async def setworkgroup_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def setdbgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def setexcelgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
     if not _is_admin(update):
@@ -900,14 +975,14 @@ async def setdbgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if update.effective_chat.type == "private":
         await update.message.reply_text(
-            "Run `/setdbgroup` inside your dedicated Database Backup group.", parse_mode="Markdown"
+            "Run `/setexcelgroup` inside your dedicated Excel Report group.", parse_mode="Markdown"
         )
         return
 
-    await asyncio.to_thread(set_setting, "db_group_id", str(update.effective_chat.id))
+    await asyncio.to_thread(set_setting, "excel_group_id", str(update.effective_chat.id))
     await update.message.reply_text(
-        f"This group (`{update.effective_chat.id}`) is now set as the *Database Backup Group*.\n"
-        f"Every submitted slot report will automatically sync `reports.db` here.",
+        f"This group (`{update.effective_chat.id}`) is now set as the *Excel Report Group*.\n"
+        f"Every slot submission will automatically send `team_report_YYYY-MM-DD.xlsx` here.",
         parse_mode="Markdown",
     )
 
@@ -969,24 +1044,19 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     rows = await asyncio.to_thread(fetch_reports, today_str)
     members = await asyncio.to_thread(get_team_members)
 
-    on_time_total = sum(1 for r in rows if r[4] == "On Time")
-    late_total = sum(1 for r in rows if r[4] == "Late / Penalty")
-
     lines = [
         f"*Daily Summary ({today_str} IST)*",
-        f"On Time: {on_time_total} | Late: {late_total}",
+        f"Total Slot Reports Recorded: {len(rows)}",
         "",
     ]
 
     all_names = sorted(set(members) | {r[0] for r in rows})
     if not all_names:
-        lines.append("No submissions or team members recorded today.")
+        lines.append("No submissions or assistants detected today.")
     else:
         for name in all_names:
-            u_rows = [r for r in rows if r[0] == name]
-            u_on = sum(1 for r in u_rows if r[4] == "On Time")
-            u_late = sum(1 for r in u_rows if r[4] == "Late / Penalty")
-            lines.append(f"- {name}: {u_on}/5 slots on time, {u_late} late")
+            u_on = sum(1 for r in rows if r[0] == name)
+            lines.append(f"- {name}: {u_on}/5 slots submitted")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -1057,39 +1127,22 @@ async def team_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message:
         return
     members = await asyncio.to_thread(get_team_members)
-    tagged = set(m.lower() for m in await asyncio.to_thread(get_tagged_assistants))
+    tagged = {m.lower() for m in await asyncio.to_thread(get_tagged_assistants)}
     if not members:
         await update.message.reply_text(
-            "Team roster is empty. Use `/tags` or `/addtag @username`.", parse_mode="Markdown"
+            "No assistants detected yet. Send any message in the work group or use `/tags`.",
+            parse_mode="Markdown",
         )
         return
-    lines = ["Team Roster:"]
+    lines = ["Recognized Assistants / Team Roster:"]
     for m in members:
-        badge = " (Tagged for warnings)" if m.lower() in tagged else ""
+        badge = " (Tag: ON)" if m.lower() in tagged else " (Tag: OFF)"
         lines.append(f"- {m}{badge}")
     await update.message.reply_text("\n".join(lines))
 
 
-async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    if not _is_admin(update):
-        await update.message.reply_text("Unauthorized.")
-        return
-    if not os.path.exists(DB_PATH):
-        await update.message.reply_text("No database file found yet.")
-        return
-
-    with open(DB_PATH, "rb") as db_file:
-        await update.message.reply_document(
-            document=db_file,
-            filename="reports.db",
-            caption="SQLite database backup. Reply `/restore` to this file anytime to restore.",
-            parse_mode="Markdown",
-        )
-
-
 async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply /restore to any .xlsx report file in Telegram to restore history."""
     if not update.message:
         return
     if not _is_admin(update):
@@ -1099,46 +1152,44 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     replied = update.message.reply_to_message
     if not replied or not replied.document:
         await update.message.reply_text(
-            "Reply `/restore` directly to a `reports.db` backup file.", parse_mode="Markdown"
+            "Reply `/restore` directly to a `team_report_*.xlsx` file.", parse_mode="Markdown"
         )
         return
 
     tg_file = await replied.document.get_file()
-    await tg_file.download_to_drive(custom_path=DB_PATH)
-    await asyncio.to_thread(init_db)
-    await update.message.reply_text("Database restored successfully from Telegram backup.")
+    buf = BytesIO()
+    await tg_file.download_to_memory(out=buf)
+    restored = await asyncio.to_thread(restore_from_excel_bytes, buf.getvalue())
+    await update.message.reply_text(f"Restored {restored} report rows from Excel file.")
 
 
 # ---------------------------------------------------------------------------
 # Scheduled Jobs (Daily Excel + Tagged Assistant Warnings)
 # ---------------------------------------------------------------------------
 async def send_daily_excel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if DEFAULT_ADMIN_CHAT_ID is None:
-        logger.warning("ADMIN_CHAT_ID not set; skipping scheduled 8:30 PM IST Excel report.")
-        return
-
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     excel_stream, today_count = await asyncio.to_thread(build_excel_bytes, today_str, 1)
     filename = f"team_report_{today_str}.xlsx"
 
-    await context.bot.send_document(
-        chat_id=DEFAULT_ADMIN_CHAT_ID,
-        document=excel_stream,
-        filename=filename,
-        caption=(
-            f"Daily Automated Excel Report ({today_str} | 8:30 PM IST)\n"
-            f"Total submissions today: {today_count}"
-        ),
-    )
+    if DEFAULT_ADMIN_CHAT_ID is not None:
+        await context.bot.send_document(
+            chat_id=DEFAULT_ADMIN_CHAT_ID,
+            document=excel_stream,
+            filename=filename,
+            caption=(
+                f"Daily Automated Excel Report ({today_str} | 8:30 PM IST)\n"
+                f"Total slot submissions today: {today_count}"
+            ),
+        )
 
-    await push_db_to_backup_group(
+    await push_excel_to_group(
         context,
-        caption=f"Daily Closing DB Backup | {today_str} | 8:30 PM IST | Total today: {today_count}",
+        target_date=today_str,
+        caption=f"Daily Closing Excel Report | {today_str} | 8:30 PM IST | Total today: {today_count}",
     )
 
 
 async def send_slot_open_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Tag ONLY the selected assistants from assistant_tags with a warning at slot start."""
     if not is_reminders_enabled() or not context.job:
         return
 
@@ -1149,7 +1200,6 @@ async def send_slot_open_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     slot_label = str(context.job.data)
     tagged_assistants = await asyncio.to_thread(get_tagged_assistants)
     tags_line = " ".join(tagged_assistants)
-
     attention_block = f"Attention: {tags_line}\n" if tags_line else ""
 
     if "Final" in slot_label:
@@ -1157,21 +1207,20 @@ async def send_slot_open_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> Non
             f"WARNING & REMINDER: {slot_label} is now OPEN!\n"
             f"{attention_block}"
             f"Please upload your photo report before 8:00 PM IST (grace period ends 8:15 PM IST). "
-            f"Submissions after 8:15 PM will be marked Late / Penalty."
+            f"Reports are ONLY recorded during active slot hours."
         )
     else:
         msg = (
             f"WARNING & REMINDER: {slot_label} is now OPEN!\n"
             f"{attention_block}"
-            f"Upload your photo report within 15 minutes to stay On Time. "
-            f"Late uploads will trigger a Penalty mark."
+            f"Upload your photo report within 15 minutes. "
+            f"Reports outside slot hours will NOT be recorded."
         )
 
     await context.bot.send_message(chat_id=work_group_id, text=msg)
 
 
 async def send_slot_final_warning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """5 minutes before grace ends, tag ONLY selected assistants who have NOT submitted yet."""
     if not is_reminders_enabled() or not context.job:
         return
 
@@ -1192,25 +1241,74 @@ async def send_slot_final_warning_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = (
         f"FINAL WARNING (5 MINUTES LEFT) — {slot_label}\n"
         f"Pending Assistants: {tags_line}\n"
-        f"Upload your photo report immediately! Grace period closes in 5 minutes, "
-        f"after which your slot will be marked Late / Penalty."
+        f"Upload your photo report immediately! Slot closes in 5 minutes and will NOT record late uploads."
     )
     await context.bot.send_message(chat_id=work_group_id, text=msg)
 
 
 # ---------------------------------------------------------------------------
-# Photo Report Handler
+# Group Activity: Auto-Discover Assistants + Strict Slot-Time Photo Recording
 # ---------------------------------------------------------------------------
+def _extract_username(update: Update) -> Optional[str]:
+    user = update.effective_user
+    if not user or user.is_bot:
+        return None
+    return f"@{user.username}" if user.username else (user.first_name or "Unknown User")
+
+
+async def handle_any_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Triggered on non-photo group messages (and new members) so the bot automatically
+    recognizes any assistant the moment they send any message in the work group.
+    """
+    message = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat or user.is_bot:
+        return
+
+    excel_group_id = get_excel_group_id()
+    if excel_group_id is not None and chat.id == excel_group_id:
+        return
+
+    work_group_id = get_work_group_id()
+    if work_group_id is not None and chat.id != work_group_id:
+        return
+
+    # Skip auto-tagging the owner/admin unless they manually add themselves
+    if DEFAULT_ADMIN_CHAT_ID is not None and user.id == DEFAULT_ADMIN_CHAT_ID:
+        return
+
+    # Also auto-discover newly added group members if present
+    if message.new_chat_members:
+        for member in message.new_chat_members:
+            if member.is_bot or (DEFAULT_ADMIN_CHAT_ID is not None and member.id == DEFAULT_ADMIN_CHAT_ID):
+                continue
+            m_name = f"@{member.username}" if member.username else (member.first_name or "Unknown")
+            newly = await asyncio.to_thread(auto_discover_assistant, m_name)
+            if newly:
+                logger.info("Auto-recognized new group member as assistant: %s", m_name)
+
+    username = _extract_username(update)
+    if username:
+        newly = await asyncio.to_thread(auto_discover_assistant, username)
+        if newly:
+            logger.info("Auto-recognized assistant from group message: %s", username)
+
+
 async def handle_photo_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Auto-recognize sender as assistant, then record photo report ONLY during active slot hours.
+    """
     message = update.message
     user = update.effective_user
     chat = update.effective_chat
 
-    if not message or not user or not chat:
+    if not message or not user or not chat or user.is_bot:
         return
 
-    db_group_id = get_db_group_id()
-    if db_group_id is not None and chat.id == db_group_id:
+    excel_group_id = get_excel_group_id()
+    if excel_group_id is not None and chat.id == excel_group_id:
         return
 
     work_group_id = get_work_group_id()
@@ -1218,31 +1316,46 @@ async def handle_photo_report(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.debug("Ignored message from non-allowed chat_id=%s", chat.id)
         return
 
-    username = f"@{user.username}" if user.username else (user.first_name or "Unknown User")
+    username = _extract_username(update) or "Unknown User"
+
+    # Auto-recognize non-admin sender as an assistant
+    if DEFAULT_ADMIN_CHAT_ID is None or user.id != DEFAULT_ADMIN_CHAT_ID:
+        await asyncio.to_thread(auto_discover_assistant, username)
+
     ist_dt = message.date.astimezone(IST)
     submission_time = ist_dt.strftime("%I:%M:%S %p IST")
     report_date = ist_dt.strftime("%Y-%m-%d")
-    reporting_slot, status = detect_slot(ist_dt)
-    caption = (message.caption or "").strip()
+    active_slot = detect_active_slot(ist_dt)
+
+    # STRICT SLOT-TIME RECORDING: Reject uploads outside active slot windows
+    if active_slot is None:
+        await message.reply_text(
+            f"Not recorded ({submission_time}): Reports are ONLY recorded during slot windows.\n"
+            f"Active IST Slots: 10:00-10:15 AM, 1:00-1:15 PM, 3:00-3:15 PM, 5:00-5:15 PM, and 7:30-8:15 PM.",
+            reply_to_message_id=message.message_id,
+        )
+        return
 
     if PREVENT_DUPLICATE_SLOTS:
         existing_time = await asyncio.to_thread(
-            has_slot_submission, username, report_date, reporting_slot
+            has_slot_submission, username, report_date, active_slot
         )
         if existing_time:
             await message.reply_text(
-                f"Duplicate skipped for {username}: {reporting_slot} was already recorded today at {existing_time}.",
+                f"Duplicate skipped for {username}: {active_slot} was already recorded today at {existing_time}.",
                 reply_to_message_id=message.message_id,
             )
             return
 
+    caption = (message.caption or "").strip()
+    status = "On Time"
+
     logger.info(
-        "Photo report received | user=%s | chat=%s | time=%s | slot=%s | status=%s",
+        "Slot photo report recorded | user=%s | chat=%s | time=%s | slot=%s",
         username,
         chat.id,
         submission_time,
-        reporting_slot,
-        status,
+        active_slot,
     )
 
     try:
@@ -1251,7 +1364,7 @@ async def handle_photo_report(update: Update, context: ContextTypes.DEFAULT_TYPE
             user.id,
             username,
             submission_time,
-            reporting_slot,
+            active_slot,
             report_date,
             status,
             caption,
@@ -1265,31 +1378,23 @@ async def handle_photo_report(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    db_caption = (
-        f"DB Sync | {username} | {reporting_slot}\n"
+    # Send updated Excel (.xlsx) file to the Excel Report Group on every recorded slot
+    excel_caption = (
+        f"Excel Updated | {username} | {active_slot}\n"
         f"Time: {submission_time} | Date: {report_date} | Status: {status}"
     )
     if caption:
-        db_caption += f"\nNote: {caption}"
-    await push_db_to_backup_group(context, caption=db_caption)
+        excel_caption += f"\nNote: {caption}"
+    await push_excel_to_group(context, target_date=report_date, caption=excel_caption)
 
     display_name = user.first_name or username
     note_line = f"\nNote: {caption}" if caption else ""
-    if status == "On Time":
-        confirmation = (
-            f"Report recorded for {display_name} ({username}).\n"
-            f"Slot: {reporting_slot}\n"
-            f"Time: {submission_time} | Date: {report_date}\n"
-            f"Status: {status}{note_line}"
-        )
-    else:
-        confirmation = (
-            f"Report recorded for {display_name} ({username}), outside scheduled windows.\n"
-            f"Slot: {reporting_slot}\n"
-            f"Time: {submission_time} | Date: {report_date}\n"
-            f"Status: {status}{note_line}"
-        )
-
+    confirmation = (
+        f"Report recorded for {display_name} ({username}).\n"
+        f"Slot: {active_slot}\n"
+        f"Time: {submission_time} | Date: {report_date}\n"
+        f"Status: {status}{note_line}"
+    )
     await message.reply_text(confirmation, reply_to_message_id=message.message_id)
 
 
@@ -1316,30 +1421,31 @@ def start_health_server() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Startup Auto-Restore & Job Scheduling
+# Startup Auto-Restore From Pinned Excel (.xlsx) & Job Scheduling
 # ---------------------------------------------------------------------------
-async def auto_restore_from_db_group(application: Application) -> None:
-    db_group_id = get_db_group_id()
-    if db_group_id is None:
+async def auto_restore_from_excel_group(application: Application) -> None:
+    excel_group_id = get_excel_group_id()
+    if excel_group_id is None:
         return
 
     if await asyncio.to_thread(count_total_reports) > 0:
         return
 
     try:
-        chat = await application.bot.get_chat(db_group_id)
+        chat = await application.bot.get_chat(excel_group_id)
         pinned = chat.pinned_message
-        if pinned and pinned.document and pinned.document.file_name == "reports.db":
+        if pinned and pinned.document and pinned.document.file_name.endswith(".xlsx"):
             tg_file = await pinned.document.get_file()
-            await tg_file.download_to_drive(custom_path=DB_PATH)
-            await asyncio.to_thread(init_db)
-            logger.info("Auto-restored reports.db from pinned backup in DB group %s", db_group_id)
+            buf = BytesIO()
+            await tg_file.download_to_memory(out=buf)
+            restored = await asyncio.to_thread(restore_from_excel_bytes, buf.getvalue())
+            logger.info("Auto-restored %s rows from pinned Excel %s", restored, pinned.document.file_name)
     except Exception as exc:
-        logger.warning("Auto-restore skipped: %s", exc)
+        logger.warning("Excel auto-restore skipped: %s", exc)
 
 
 async def post_init(application: Application) -> None:
-    await auto_restore_from_db_group(application)
+    await auto_restore_from_excel_group(application)
 
     if application.job_queue is None:
         return
@@ -1376,7 +1482,6 @@ def main() -> None:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is missing.")
 
     # Python 3.14+ no longer auto-creates a default event loop in MainThread.
-    # Setting one explicitly ensures python-telegram-bot's run_polling() works cleanly.
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -1395,7 +1500,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(tags_callback_handler))
     application.add_handler(CommandHandler("reminder", reminder_command))
     application.add_handler(CommandHandler("setworkgroup", setworkgroup_command))
-    application.add_handler(CommandHandler("setdbgroup", setdbgroup_command))
+    application.add_handler(CommandHandler(["setexcelgroup", "setdbgroup"], setexcelgroup_command))
     application.add_handler(CommandHandler(["excel", "report"], excel_command))
     application.add_handler(CommandHandler("weekly", weekly_command))
     application.add_handler(CommandHandler("summary", summary_command))
@@ -1403,11 +1508,15 @@ def main() -> None:
     application.add_handler(CommandHandler("addmember", addmember_command))
     application.add_handler(CommandHandler("removemember", removemember_command))
     application.add_handler(CommandHandler("team", team_command))
-    application.add_handler(CommandHandler("backup", backup_command))
     application.add_handler(CommandHandler("restore", restore_command))
 
+    # Photo reports -> strict slot-time recording + Excel push
     group_photo_filter = filters.ChatType.GROUPS & (filters.PHOTO | filters.Document.IMAGE)
     application.add_handler(MessageHandler(group_photo_filter, handle_photo_report))
+
+    # Any other group message / new member -> auto-discover assistant
+    group_any_msg_filter = filters.ChatType.GROUPS & ~filters.COMMAND & ~group_photo_filter
+    application.add_handler(MessageHandler(group_any_msg_filter, handle_any_group_message))
 
     logger.info("Starting Telegram Excel Report Bot (polling)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
