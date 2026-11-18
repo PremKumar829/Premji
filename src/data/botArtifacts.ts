@@ -106,6 +106,7 @@ export function evaluateIstSlot(time24: string): SlotResult {
 export interface SheetRow {
   id: string;
   username: string;
+  joining: string;
   submissionTime: string;
   reportingSlot: string;
   date: string;
@@ -116,35 +117,38 @@ export interface SheetRow {
 export const INITIAL_SHEET_ROWS: SheetRow[] = [
   {
     id: 'row-1',
-    username: '@arjun_ops',
-    submissionTime: '10:04:18 AM IST',
+    username: '@Govind7549',
+    joining: '40',
+    submissionTime: '10:02:14 AM IST',
     reportingSlot: '10:00 AM Slot',
-    date: '2026-11-17',
+    date: '2026-11-18',
     status: 'On Time',
-    caption: 'Morning floor dispatch check',
+    caption: 'Username- @Govind7549\nJoining- 40',
   },
   {
     id: 'row-2',
     username: '@priya_lead',
-    submissionTime: '01:14:52 PM IST',
+    joining: '32',
+    submissionTime: '01:08:52 PM IST',
     reportingSlot: '1:00 PM Slot',
-    date: '2026-11-17',
+    date: '2026-11-18',
     status: 'On Time',
-    caption: 'Midday inventory photo',
+    caption: 'Username- @priya_lead\nJoining- 32',
   },
   {
     id: 'row-3',
     username: '@sneha_qa',
+    joining: '55',
     submissionTime: '07:54:31 PM IST',
     reportingSlot: 'Final Report (Before 8:00 PM)',
-    date: '2026-11-17',
+    date: '2026-11-18',
     status: 'On Time',
-    caption: 'End-of-day closing log',
+    caption: 'Username- @sneha_qa\nJoining- 55',
   },
 ];
 
 export const INITIAL_TEAM_ROSTER: string[] = [
-  '@arjun_ops',
+  '@Govind7549',
   '@priya_lead',
   '@sneha_qa',
   '@vikram_dev',
@@ -157,6 +161,21 @@ export interface BotCommandInfo {
 }
 
 export const BOT_COMMANDS: BotCommandInfo[] = [
+  {
+    command: '/add [10am|1pm|3pm|5pm|final]',
+    scope: 'Admin (Reply to msg)',
+    description: 'Reply to any already-sent report in the group to record its Username, Joining, and original IST timing.',
+  },
+  {
+    command: '/addreport @user 40 [10am]',
+    scope: 'Admin Only',
+    description: 'Manually add or bulk-paste multiple past reports into SQLite and Excel in one message.',
+  },
+  {
+    command: '/check',
+    scope: 'Group / DM',
+    description: 'Shows current Chat ID, configured Work/Excel Group IDs, active IST slot, and whether counting is active.',
+  },
   {
     command: '/tags (or /assistants)',
     scope: 'Admin Only',
@@ -190,17 +209,22 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
   {
     command: '/weekly',
     scope: 'Admin / Group',
-    description: 'Sends a 7-day consolidated Excel workbook with Member Compliance %.',
+    description: 'Sends a 7-day consolidated Excel workbook with Total Joining and Member Compliance %.',
   },
   {
     command: '/summary & /mystatus',
     scope: 'Group / DM',
-    description: 'Shows live slot submission counts or an individual assistant’s 5-slot progress.',
+    description: 'Shows live slot submission counts, total joining, and an interactive button to remove/restore assistant names from Summary.',
   },
   {
-    command: '/restore',
+    command: '/removesummary @user | /restoresummary @user',
     scope: 'Admin Only',
-    description: 'Reply /restore to any .xlsx file to restore history (plus auto-restore from pinned .xlsx on boot).',
+    description: 'Removes or restores any assistant name from the Telegram Summary format & Excel Member Summary / Slot Matrix sheets.',
+  },
+  {
+    command: '/restore (or /recover)',
+    scope: 'Admin Only',
+    description: 'Recovers all old reports, old Work Group ID, members & tags from pinned or replied .db (reports.db) or .xlsx files in Database Group.',
   },
 ];
 

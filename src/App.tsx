@@ -55,11 +55,11 @@ export default function App() {
   const [copiedTarget, setCopiedTarget] = useState<string | null>(null);
 
   // Simulator state
-  const [simUsername, setSimUsername] = useState('@vikram_dev');
-  const [simFirstName, setSimFirstName] = useState('Vikram');
-  const [simTime24, setSimTime24] = useState('19:41:10');
-  const [simDate, setSimDate] = useState('2026-11-17');
-  const [simCaption, setSimCaption] = useState('Evening closing photo');
+  const [simUsername, setSimUsername] = useState('@Govind7549');
+  const [simFirstName, setSimFirstName] = useState('RAVI');
+  const [simTime24, setSimTime24] = useState('10:02:14');
+  const [simDate, setSimDate] = useState('2026-11-18');
+  const [simCaption, setSimCaption] = useState('Username- @Govind7549\nJoining- 40');
   const [preventDuplicates, setPreventDuplicates] = useState(true);
   const [simFeedback, setSimFeedback] = useState<{
     type: 'recorded' | 'ignored' | 'discovered';
@@ -71,7 +71,7 @@ export default function App() {
   const [reminderSlotId, setReminderSlotId] = useState('10am');
   const [reminderPreviewMode, setReminderPreviewMode] = useState<ReminderPreviewMode>('open');
   const [assistantTags, setAssistantTags] = useState<string[]>([
-    '@arjun_ops',
+    '@Govind7549',
     '@priya_lead',
     '@sneha_qa',
   ]);
@@ -132,14 +132,18 @@ export default function App() {
       );
       const slotStates = REPORTING_SLOTS.map((slot) => {
         const match = memberRows.find((r) => r.reportingSlot === slot.label);
-        return match ? match.submissionTime.replace(' IST', '') : null;
+        if (!match) return null;
+        const timeShort = match.submissionTime.replace(' IST', '');
+        return match.joining ? `${match.joining} (${timeShort})` : timeShort;
       });
       const onTimeSlots = slotStates.filter(Boolean).length;
+      const totalJoining = memberRows.reduce((sum, r) => sum + (Number.parseInt(r.joining, 10) || 0), 0);
       const compliance = Math.round((onTimeSlots / REPORTING_SLOTS.length) * 100);
       return {
         member,
         slotStates,
         onTimeSlots,
+        totalJoining,
         compliance,
       };
     });
@@ -234,15 +238,25 @@ export default function App() {
 
   const handleSimulateUpload = (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanUser = simUsername.trim() || simFirstName.trim() || 'Team Member';
-    const targetDate = simDate || '2026-11-17';
+    const rawCaption = simCaption.trim();
+    const userMatch = rawCaption.match(/(?:username|user\s*name|user|id)\s*[:=\-–—]+\s*(@?[A-Za-z0-9_]{3,})/i);
+    const joinMatch = rawCaption.match(/(?:total\s*)?(?:joining|joins|join)\s*[:=\-–—]*\s*(\d+)/i);
+    const fallbackUser = simUsername.trim() || simFirstName.trim() || 'Team Member';
+    const extractedUser = userMatch?.[1]?.trim();
+    const cleanUser = extractedUser
+      ? extractedUser.startsWith('@')
+        ? extractedUser
+        : `@${extractedUser}`
+      : fallbackUser;
+    const joining = joinMatch?.[1]?.trim() || '';
+    const targetDate = simDate || '2026-11-18';
 
     autoDiscoverUser(cleanUser);
 
     if (!liveEvaluation.inActiveSlot) {
       setSimFeedback({
         type: 'ignored',
-        text: `Not recorded (${liveEvaluation.formattedTimeIst}): Reports are ONLY recorded during active slot windows. Assistant was still auto-recognized.`,
+        text: `Not recorded (${liveEvaluation.formattedTimeIst}): Reports are ONLY recorded during active slot windows. (Admin can reply /add to record past messages.)`,
       });
       return;
     }
@@ -266,16 +280,17 @@ export default function App() {
     const newRow: SheetRow = {
       id: `row-${Date.now()}`,
       username: cleanUser,
+      joining,
       submissionTime: liveEvaluation.formattedTimeIst,
       reportingSlot: liveEvaluation.reportingSlot,
       date: targetDate,
       status: 'On Time',
-      caption: simCaption.trim(),
+      caption: rawCaption,
     };
     setSheetRows((prev) => [newRow, ...prev]);
     setSimFeedback({
       type: 'recorded',
-      text: `Recorded in ${liveEvaluation.reportingSlot} and pushed updated team_report_${targetDate}.xlsx to Excel Group.`,
+      text: `Report recorded for ${cleanUser}${joining ? ` (Joining: ${joining})` : ''} in ${liveEvaluation.reportingSlot} and pushed updated team_report_${targetDate}.xlsx.`,
     });
   };
 
@@ -313,16 +328,24 @@ export default function App() {
   };
 
   const handleExportCsv = () => {
-    const headers = ['Username', 'Submission Time', 'Reporting Slot', 'Date', 'Status', 'Caption'];
+    const headers = ['Username', 'Joining', 'Submission Time', 'Reporting Slot', 'Date', 'Status', 'Caption'];
     const lines = [
       headers.join(','),
       ...sheetRows.map((row) =>
-        [row.username, row.submissionTime, row.reportingSlot, row.date, row.status, row.caption]
+        [
+          row.username,
+          row.joining,
+          row.submissionTime,
+          row.reportingSlot,
+          row.date,
+          row.status,
+          row.caption,
+        ]
           .map((cell) => `"${cell.replace(/"/g, '""')}"`)
           .join(',')
       ),
     ];
-    handleDownloadFile(`team_report_${simDate || '2026-11-17'}.csv`, lines.join('\n'));
+    handleDownloadFile(`team_report_${simDate || '2026-11-18'}.csv`, lines.join('\n'));
   };
 
   const toggleChecklistStep = (stepId: string) => {
@@ -543,15 +566,15 @@ export default function App() {
                     htmlFor="sim-caption"
                     className="block text-xs font-semibold text-slate-700 mb-1.5"
                   >
-                    Photo Caption (Optional)
+                    Caption / Report Text
                   </label>
-                  <input
+                  <textarea
                     id="sim-caption"
-                    type="text"
+                    rows={2}
                     value={simCaption}
                     onChange={(e) => setSimCaption(e.target.value)}
-                    placeholder="Optional note..."
-                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-sky-600 focus:outline-none"
+                    placeholder={'Username- @Govind7549\nJoining- 40'}
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs text-slate-900 focus:border-sky-600 focus:outline-none"
                   />
                 </div>
               </div>
@@ -611,7 +634,7 @@ export default function App() {
                     className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     <Send className="h-4 w-4" aria-hidden="true" />
-                    <span>Upload Slot Photo</span>
+                    <span>Log Caption &amp; Joining</span>
                   </button>
                 </div>
               </div>
@@ -1012,6 +1035,7 @@ export default function App() {
                     <thead>
                       <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
                         <th className="px-4 py-2.5">Username</th>
+                        <th className="px-4 py-2.5">Joining</th>
                         <th className="px-4 py-2.5">Submission Time</th>
                         <th className="px-4 py-2.5">Reporting Slot</th>
                         <th className="px-4 py-2.5">Date</th>
@@ -1024,6 +1048,9 @@ export default function App() {
                         <tr key={row.id} className="hover:bg-slate-50/80 transition-colors">
                           <td className="px-4 py-2.5 font-medium text-slate-900 whitespace-nowrap">
                             {row.username}
+                          </td>
+                          <td className="px-4 py-2.5 font-mono text-xs font-semibold text-sky-700 tabular-nums whitespace-nowrap">
+                            {row.joining || '—'}
                           </td>
                           <td className="px-4 py-2.5 font-mono text-xs text-slate-700 tabular-nums whitespace-nowrap">
                             {row.submissionTime}
@@ -1088,6 +1115,7 @@ export default function App() {
                           {s.shortLabel}
                         </th>
                       ))}
+                      <th className="px-3 py-2.5 text-right">Total Joining</th>
                       <th className="px-3 py-2.5 text-right">Compliance</th>
                       <th className="px-3 py-2.5 text-right">Roster</th>
                     </tr>
@@ -1107,6 +1135,9 @@ export default function App() {
                             )}
                           </td>
                         ))}
+                        <td className="px-3 py-2.5 font-mono text-right tabular-nums font-semibold text-sky-700">
+                          {row.totalJoining}
+                        </td>
                         <td className="px-3 py-2.5 font-mono text-right tabular-nums font-semibold text-slate-900">
                           {row.compliance}%
                         </td>
