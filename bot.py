@@ -37,6 +37,10 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+try:
+    from telegram import ReactionTypeEmoji
+except ImportError:
+    ReactionTypeEmoji = None  # type: ignore[assignment]
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -98,6 +102,8 @@ DAILY_SEND_TIME_IST = time(hour=20, minute=30, second=0, tzinfo=IST)  # 8:30 PM 
 _REPORT_LOCK = asyncio.Lock()
 _SEEN_MEDIA_GROUPS: dict[str, datetime] = {}
 _MISMATCH_WARN_CACHE: dict[int, datetime] = {}
+_ADMIN_SYNC_CACHE: dict[int, datetime] = {}
+_CELEBRATION_EMOJIS: tuple[str, ...] = ("🔥", "🎉", "💯", "🏆", "⚡", "🤩", "👏")
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +177,70 @@ def infer_slot_from_time(ist_dt: datetime) -> str:
     return best_slot.label
 
 
+def _get_slot_by_label(slot_label: str) -> Optional[ReportingSlot]:
+    for slot in REPORTING_SLOTS:
+        if slot.label == slot_label:
+            return slot
+    return None
+
+
+def _parse_ist_time_str(sub_time: str) -> Optional[time]:
+    cleaned = re.sub(r"\s*IST\s*$", "", (sub_time or "").strip(), flags=re.IGNORECASE).strip()
+    for fmt in ("%I:%M:%S %p", "%I:%M %p", "%I:%M:%S%p", "%I:%M%p", "%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(cleaned, fmt).time()
+        except ValueError:
+            continue
+    return None
+
+
+def evaluate_slot_status(ist_dt: datetime, slot_label: str) -> str:
+    """Strictly check if an IST timestamp falls within the slot's cutoff window."""
+    slot = _get_slot_by_label(slot_label)
+    if not slot:
+        return "On Time"
+    current_t = ist_dt.time().replace(tzinfo=None)
+    if slot.start <= current_t <= slot.end:
+        return "On Time"
+    if current_t > slot.end:
+        return "Late"
+    start_sec = slot.start.hour * 3600 + slot.start.minute * 60 + slot.start.second
+    cur_sec = current_t.hour * 3600 + current_t.minute * 60 + current_t.second
+    if 0 <= (start_sec - cur_sec) <= 900:
+        return "On Time"
+    return "Late"
+
+
+def evaluate_slot_status_from_strings(submission_time: str, slot_label: str) -> str:
+    parsed_t = _parse_ist_time_str(submission_time)
+    slot = _get_slot_by_label(slot_label)
+    if not parsed_t or not slot:
+        return "On Time"
+    if slot.start <= parsed_t <= slot.end:
+        return "On Time"
+    if parsed_t > slot.end:
+        return "Late"
+    start_sec = slot.start.hour * 3600 + slot.start.minute * 60 + slot.start.second
+    cur_sec = parsed_t.hour * 3600 + parsed_t.minute * 60 + parsed_t.second
+    if 0 <= (start_sec - cur_sec) <= 900:
+        return "On Time"
+    return "Late"
+
+
+def recalculate_report_statuses(conn: sqlite3.Connection) -> int:
+    """Auto-fix any previously saved 'On Time' rows whose submission_time is past the slot's 15-min cutoff."""
+    fixed = 0
+    rows = conn.execute(
+        "SELECT id, submission_time, reporting_slot, status FROM reports WHERE status = 'On Time'"
+    ).fetchall()
+    for row_id, sub_time, slot_label, status in rows:
+        expected = evaluate_slot_status_from_strings(str(sub_time or ""), str(slot_label or ""))
+        if expected != status:
+            conn.execute("UPDATE reports SET status = ? WHERE id = ?", (expected, row_id))
+            fixed += 1
+    return fixed
+
+
 _USERNAME_PATTERN = re.compile(
     r"(?:username|user\s*name|user|tg\s*id|id)\s*[:=\-–—]+\s*(@?[A-Za-z0-9_]{3,})",
     re.IGNORECASE,
@@ -202,6 +272,13 @@ def is_text_report_message(raw_text: str) -> bool:
     if not raw_text:
         return False
     return bool(_JOINING_PATTERN.search(raw_text))
+
+
+def is_report_caption(raw_text: str) -> bool:
+    """Only treat messages/photos as reports when caption explicitly contains Joining or Username/TG ID fields."""
+    if not raw_text:
+        return False
+    return bool(_JOINING_PATTERN.search(raw_text) or _USERNAME_PATTERN.search(raw_text))
 
 
 def _normalize_tag(raw: str) -> str:
@@ -275,6 +352,16 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS known_group_admins (
+                admin_key TEXT PRIMARY KEY,
+                user_id INTEGER,
+                username TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
 
         # Lightweight schema migrations
         tag_cols = {
@@ -331,6 +418,7 @@ def init_db() -> None:
                         (norm, now_iso),
                     )
 
+        recalculate_report_statuses(conn)
         conn.commit()
 
 
@@ -452,15 +540,79 @@ def toggle_summary_exclusion(username: str) -> bool:
     return True
 
 
+def get_known_admin_sets() -> tuple[set[int], set[str]]:
+    admin_ids: set[int] = set()
+    admin_keys: set[str] = set()
+    if DEFAULT_ADMIN_CHAT_ID is not None:
+        admin_ids.add(DEFAULT_ADMIN_CHAT_ID)
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT user_id, username FROM known_group_admins"
+        ).fetchall()
+    for uid, uname in rows:
+        if uid is not None:
+            admin_ids.add(int(uid))
+        k = _match_key(str(uname or ""))
+        if k:
+            admin_keys.add(k)
+    return admin_ids, admin_keys
+
+
+def is_known_group_admin(username: str = "", user_id: Optional[int] = None) -> bool:
+    admin_ids, admin_keys = get_known_admin_sets()
+    if user_id is not None and user_id in admin_ids:
+        return True
+    key = _match_key(username)
+    return bool(key and key in admin_keys)
+
+
+def sync_group_admins(admin_pairs: list[tuple[Optional[int], str]]) -> int:
+    """Persist live Telegram group admins and purge them from assistant_tags & team_members."""
+    now_iso = datetime.now(IST).isoformat()
+    removed = 0
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM known_group_admins")
+        for uid, uname in admin_pairs:
+            clean_u = (uname or "").strip()
+            key = _match_key(clean_u)
+            admin_key = f"id:{uid}" if uid is not None else f"u:{key}"
+            if not admin_key or (uid is None and not key):
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO known_group_admins (admin_key, user_id, username, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (admin_key, uid, clean_u or f"Admin({uid})", now_iso),
+            )
+            if uid is not None:
+                c1 = conn.execute("DELETE FROM team_members WHERE user_id = ?", (uid,))
+                c2 = conn.execute("DELETE FROM assistant_tags WHERE user_id = ?", (uid,))
+                removed += c1.rowcount + c2.rowcount
+            if key:
+                c3 = conn.execute(
+                    "DELETE FROM team_members WHERE LOWER(LTRIM(username, '@')) = ?",
+                    (key,),
+                )
+                c4 = conn.execute(
+                    "DELETE FROM assistant_tags WHERE LOWER(LTRIM(username, '@')) = ?",
+                    (key,),
+                )
+                removed += c3.rowcount + c4.rowcount
+        conn.commit()
+    return removed
+
+
 def auto_discover_assistant(username: str, user_id: Optional[int] = None) -> bool:
     """
     Automatically register any non-admin group member as an assistant on their first message.
-    Respects summary_excluded so removed assistants are not auto-re-added by casual messages.
-    Also updates user_id if missing so mentions work even without @username.
+    Blocks Group Admins and respects summary_excluded so removed members stay excluded.
     """
     clean = username.strip()
     key = _match_key(clean)
     if not clean or not key:
+        return False
+    if is_known_group_admin(clean, user_id):
         return False
     now_iso = datetime.now(IST).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
@@ -538,17 +690,29 @@ def remove_team_member(username: str) -> bool:
 
 
 def get_team_members() -> list[str]:
+    admin_ids, admin_keys = get_known_admin_sets()
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT username FROM team_members ORDER BY username ASC").fetchall()
-        return [r[0] for r in rows]
+        rows = conn.execute(
+            "SELECT username, user_id FROM team_members ORDER BY username ASC"
+        ).fetchall()
+    return [
+        u
+        for u, uid in rows
+        if (uid is None or uid not in admin_ids) and _match_key(u) not in admin_keys
+    ]
 
 
 def get_tagged_assistants_with_ids() -> list[tuple[str, Optional[int]]]:
+    admin_ids, admin_keys = get_known_admin_sets()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             "SELECT username, user_id FROM assistant_tags WHERE is_active = 1 ORDER BY username ASC"
         ).fetchall()
-        return [(r[0], r[1]) for r in rows]
+    return [
+        (u, uid)
+        for u, uid in rows
+        if (uid is None or uid not in admin_ids) and _match_key(u) not in admin_keys
+    ]
 
 
 def get_tagged_assistants() -> list[str]:
@@ -731,7 +895,8 @@ def upsert_report_to_db(
             conn.commit()
             action = "inserted"
 
-    auto_discover_assistant(username, user_id=user_id)
+    if not is_known_group_admin(username, user_id):
+        auto_discover_assistant(username, user_id=user_id)
     return action
 
 
@@ -820,7 +985,7 @@ def _style_sheet(
             if status_val == "On Time":
                 status_cell.fill = on_time_fill
                 status_cell.font = on_time_font
-            elif status_val in ("Late / Penalty", "Missed"):
+            elif any(w in status_val.lower() for w in ("late", "missed", "outside")):
                 status_cell.fill = late_fill
                 status_cell.font = late_font
 
@@ -865,12 +1030,14 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
 
     all_rows = fetch_reports()
     excluded_keys = {_match_key(u) for u in get_summary_excluded()}
+    _admin_ids, admin_keys = get_known_admin_sets()
+    hidden_keys = excluded_keys | admin_keys
     members = [
         m
         for m in _dedup_case_insensitive(
             get_team_members() + get_tagged_assistants() + [r[0] for r in period_rows]
         )
-        if _match_key(m) not in excluded_keys
+        if _match_key(m) not in hidden_keys
     ]
     slot_labels = [s.label for s in REPORTING_SLOTS]
 
@@ -892,19 +1059,28 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
     ws_summary = wb.create_sheet(title="Member Summary")
     summary_rows: list[tuple[str, ...]] = []
     for member in members:
-        member_rows = [r for r in period_rows if r[0].lower() == member.lower()]
+        member_rows = [r for r in period_rows if _match_key(r[0]) == _match_key(member)]
         on_time = sum(1 for r in member_rows if r[5] == "On Time")
+        late_count = sum(1 for r in member_rows if r[5] != "On Time")
         total_joining = sum(_safe_int(r[1]) for r in member_rows)
         expected_slots = len(slot_labels) * days
-        missed = max(expected_slots - on_time, 0)
+        missed = max(expected_slots - on_time - late_count, 0)
         compliance = round((on_time / expected_slots) * 100) if expected_slots else 0
         summary_rows.append(
-            (member, str(total_joining), str(on_time), str(missed), f"{compliance}%", today_str)
+            (
+                member,
+                str(total_joining),
+                str(on_time),
+                str(late_count),
+                str(missed),
+                f"{compliance}%",
+                today_str,
+            )
         )
 
     _style_sheet(
         ws_summary,
-        ["Username", "Total Joining", "Submitted On Time", "Missed Slots", "Compliance %", "Reference Date"],
+        ["Username", "Total Joining", "Submitted On Time", "Late", "Missed Slots", "Compliance %", "Reference Date"],
         summary_rows,
     )
 
@@ -913,17 +1089,22 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
     matrix_rows: list[tuple[str, ...]] = []
     for member in members:
         member_day_slots = {
-            r[3]: (r[1], r[2]) for r in target_day_rows if r[0].lower() == member.lower()
+            r[3]: (r[1], r[2], r[5]) for r in target_day_rows if _match_key(r[0]) == _match_key(member)
         }
         row_cells = [member]
         day_joining = 0
         for label in slot_labels:
             if label in member_day_slots:
-                j_val, t_val = member_day_slots[label]
+                j_val, t_val, st_val = member_day_slots[label]
                 day_joining += _safe_int(j_val)
-                row_cells.append(
-                    f"Join: {j_val} ({t_val})" if j_val else f"On Time ({t_val})"
-                )
+                if st_val == "On Time":
+                    row_cells.append(
+                        f"Join: {j_val} ({t_val})" if j_val else f"On Time ({t_val})"
+                    )
+                else:
+                    row_cells.append(
+                        f"{st_val}: {j_val} ({t_val})" if j_val else f"{st_val} ({t_val})"
+                    )
             else:
                 row_cells.append("Missed")
         row_cells.append(str(day_joining))
@@ -964,6 +1145,11 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
         cfg_rows.append(("member_tag", u, f"active={act};user_id={uid if uid is not None else ''}"))
     for u in get_summary_excluded():
         cfg_rows.append(("summary_excluded", u, ""))
+    with sqlite3.connect(DB_PATH) as conn:
+        for uid, uname in conn.execute(
+            "SELECT user_id, username FROM known_group_admins ORDER BY username ASC"
+        ).fetchall():
+            cfg_rows.append(("group_admin", str(uname or ""), str(uid if uid is not None else "")))
     _style_sheet(ws_cfg, ["Key", "Value", "Extra"], cfg_rows)
 
     output = BytesIO()
@@ -1011,6 +1197,9 @@ def restore_from_excel_bytes(excel_bytes: bytes) -> dict[str, object]:
                 caption = str(row[5] or "").strip() if len(row) > 5 else ""
                 if not joining and caption:
                     _, joining = parse_report_fields(caption, username)
+
+            if status == "On Time" and sub_time and slot_label:
+                status = evaluate_slot_status_from_strings(sub_time, slot_label)
 
             exists = conn.execute(
                 """
@@ -1107,7 +1296,15 @@ def restore_from_excel_bytes(excel_bytes: bytes) -> dict[str, object]:
                         "INSERT OR IGNORE INTO summary_excluded (username, added_at) VALUES (?, ?)",
                         (v, now_iso),
                     )
+                elif k == "group_admin" and (v or extra):
+                    uid_val = _parse_optional_int(extra, "group_admin_id")
+                    akey = f"id:{uid_val}" if uid_val is not None else f"u:{_match_key(v)}"
+                    conn.execute(
+                        "INSERT OR REPLACE INTO known_group_admins (admin_key, user_id, username, updated_at) VALUES (?, ?, ?, ?)",
+                        (akey, uid_val, v or f"Admin({uid_val})", now_iso),
+                    )
 
+        recalculate_report_statuses(conn)
         conn.commit()
 
     return {
@@ -1214,6 +1411,15 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                             (clean_u, str(added_at or now_iso)),
                         )
 
+            if "known_group_admins" in tables:
+                for akey, uid, uname, upd in src.execute(
+                    "SELECT admin_key, user_id, username, updated_at FROM known_group_admins"
+                ).fetchall():
+                    dst.execute(
+                        "INSERT OR REPLACE INTO known_group_admins (admin_key, user_id, username, updated_at) VALUES (?, ?, ?, ?)",
+                        (str(akey), uid, str(uname or ""), str(upd or now_iso)),
+                    )
+
             if "reports" in tables:
                 rep_cols = {r[1] for r in src.execute("PRAGMA table_info(reports)").fetchall()}
                 uid_expr = "user_id" if "user_id" in rep_cols else "NULL"
@@ -1273,6 +1479,7 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                         (u_str, uid, now_iso),
                     )
 
+            recalculate_report_statuses(dst)
             dst.commit()
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -1396,26 +1603,31 @@ def _build_summary_view(today_str: str) -> tuple[str, InlineKeyboardMarkup]:
     members = get_team_members()
     excluded = get_summary_excluded()
     excluded_keys = {_match_key(u) for u in excluded}
+    _admin_ids, admin_keys = get_known_admin_sets()
+    hidden_keys = excluded_keys | admin_keys
+
+    visible_rows = [r for r in rows if _match_key(r[0]) not in admin_keys]
 
     lines = [
         f"<b>Daily Summary ({today_str} IST)</b>",
-        f"Total Slot Reports Recorded: {len(rows)}",
+        f"Total Slot Reports Recorded: {len(visible_rows)}",
         "",
     ]
 
     all_names = [
         name
-        for name in _dedup_case_insensitive(members + [r[0] for r in rows])
-        if _match_key(name) not in excluded_keys
+        for name in _dedup_case_insensitive(members + [r[0] for r in visible_rows])
+        if _match_key(name) not in hidden_keys
     ]
     if not all_names:
         lines.append("No active assistants shown in summary.")
     else:
         for name in all_names:
-            u_rows = [r for r in rows if _match_key(r[0]) == _match_key(name)]
-            u_on = len(u_rows)
+            u_rows = [r for r in visible_rows if _match_key(r[0]) == _match_key(name)]
+            u_late = sum(1 for r in u_rows if r[5] != "On Time")
             u_join = sum(_safe_int(r[1]) for r in u_rows)
-            lines.append(f"- {html.escape(name)}: {u_on}/5 slots | Joining: {u_join}")
+            late_note = f" ({u_late} Late)" if u_late > 0 else ""
+            lines.append(f"- {html.escape(name)}: {len(u_rows)}/5 slots{late_note} | Joining: {u_join}")
 
     markup = InlineKeyboardMarkup(
         [
@@ -1432,12 +1644,17 @@ def _build_summary_view(today_str: str) -> tuple[str, InlineKeyboardMarkup]:
 
 def _build_summary_manage_panel(today_str: str) -> tuple[str, InlineKeyboardMarkup]:
     rows = fetch_reports(today_str)
-    candidates = _dedup_case_insensitive(
-        get_team_members()
-        + get_tagged_assistants()
-        + [r[0] for r in rows]
-        + get_summary_excluded()
-    )
+    _admin_ids, admin_keys = get_known_admin_sets()
+    candidates = [
+        m
+        for m in _dedup_case_insensitive(
+            get_team_members()
+            + get_tagged_assistants()
+            + [r[0] for r in rows]
+            + get_summary_excluded()
+        )
+        if _match_key(m) not in admin_keys
+    ]
     excluded_keys = {_match_key(u) for u in get_summary_excluded()}
 
     lines = [
@@ -1605,6 +1822,8 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if slot_label is None:
         slot_label = infer_slot_from_time(ist_dt)
 
+    status = evaluate_slot_status(ist_dt, slot_label)
+
     action = await asyncio.to_thread(
         upsert_report_to_db,
         effective_uid,
@@ -1613,7 +1832,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         submission_time,
         slot_label,
         report_date,
-        "On Time",
+        status,
         raw_text,
         orig_dt.isoformat(),
         True,
@@ -1621,7 +1840,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     excel_caption = (
         f"Excel Updated ({action}) | {username} | Joining: {joining or 'N/A'} | {slot_label}\n"
-        f"Time: {submission_time} | Date: {report_date} | Status: On Time"
+        f"Time: {submission_time} | Date: {report_date} | Status: {status}"
     )
     await push_excel_to_group(context, target_date=report_date, caption=excel_caption)
 
@@ -1630,7 +1849,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Username: <code>{html.escape(username)}</code>\n"
         f"Joining: <b>{html.escape(joining or 'N/A')}</b>\n"
         f"Timing: {html.escape(submission_time)} | Date: {report_date}\n"
-        f"Slot: {html.escape(slot_label)}",
+        f"Slot: {html.escape(slot_label)} | Status: <b>{html.escape(status)}</b>",
         parse_mode="HTML",
         reply_to_message_id=replied.message_id,
     )
@@ -1673,6 +1892,7 @@ async def addreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         slot_arg = parse_slot_alias(lines[0]) if lines else None
         slot_label = slot_arg or infer_slot_from_time(ist_now)
         sub_time = ist_now.strftime("%I:%M:%S %p IST")
+        status = evaluate_slot_status(ist_now, slot_label)
         await asyncio.to_thread(
             upsert_report_to_db,
             None,
@@ -1681,12 +1901,12 @@ async def addreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             sub_time,
             slot_label,
             today_str,
-            "On Time",
+            status,
             joined_block,
             ist_now.isoformat(),
             True,
         )
-        added_items.append(f"{u_name} | Joining: {j_val or 'N/A'} | {slot_label}")
+        added_items.append(f"{u_name} | Joining: {j_val or 'N/A'} | {slot_label} ({status})")
     else:
         for ln in lines:
             parts = ln.split()
@@ -1706,23 +1926,26 @@ async def addreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 if maybe_slot:
                     slot_label = maybe_slot
                     continue
-                if re.match(r"^\d{1,2}:\d{2}$", token):
+                if re.match(r"^\d{1,2}:\d{2}(?:am|pm)?$", token, flags=re.IGNORECASE):
                     custom_time = token
 
+            target_dt = ist_now
             if custom_time:
-                try:
-                    parsed_t = datetime.strptime(custom_time, "%H:%M").time()
-                    custom_dt = datetime.combine(ist_now.date(), parsed_t, tzinfo=IST)
-                    sub_time = custom_dt.strftime("%I:%M:%S %p IST")
+                parsed_t = _parse_ist_time_str(custom_time)
+                if parsed_t:
+                    target_dt = datetime.combine(ist_now.date(), parsed_t, tzinfo=IST)
+                    sub_time = target_dt.strftime("%I:%M:%S %p IST")
                     if slot_label is None:
-                        slot_label = infer_slot_from_time(custom_dt)
-                except ValueError:
+                        slot_label = infer_slot_from_time(target_dt)
+                else:
                     sub_time = ist_now.strftime("%I:%M:%S %p IST")
             else:
                 sub_time = ist_now.strftime("%I:%M:%S %p IST")
 
             if slot_label is None:
-                slot_label = infer_slot_from_time(ist_now)
+                slot_label = infer_slot_from_time(target_dt)
+
+            status = evaluate_slot_status(target_dt, slot_label)
 
             await asyncio.to_thread(
                 upsert_report_to_db,
@@ -1732,12 +1955,12 @@ async def addreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 sub_time,
                 slot_label,
                 today_str,
-                "On Time",
+                status,
                 f"Username- {norm_user}\nJoining- {joining}" if joining else norm_user,
-                ist_now.isoformat(),
+                target_dt.isoformat(),
                 True,
             )
-            added_items.append(f"{norm_user} | Joining: {joining or 'N/A'} | {slot_label} ({sub_time})")
+            added_items.append(f"{norm_user} | Joining: {joining or 'N/A'} | {slot_label} ({sub_time} | {status})")
 
     if not added_items:
         await update.message.reply_text("No valid rows found. Example: <code>/addreport @Govind7549 40 10am</code>", parse_mode="HTML")
@@ -1766,6 +1989,8 @@ async def tags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Only the configured admin can manage assistant tags.")
         return
 
+    sync_cid = update.effective_chat.id if update.effective_chat.id < 0 else get_work_group_id()
+    await refresh_group_admins(context.bot, sync_cid, force=True)
     text, markup = await asyncio.to_thread(_build_tags_panel, update.effective_chat.id)
     await update.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
 
@@ -2045,6 +2270,12 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.message:
         return
 
+    sync_cid = (
+        update.effective_chat.id
+        if update.effective_chat and update.effective_chat.id < 0
+        else get_work_group_id()
+    )
+    await refresh_group_admins(context.bot, sync_cid)
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     text, markup = await asyncio.to_thread(_build_summary_view, today_str)
     await update.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
@@ -2185,15 +2416,21 @@ async def removemember_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def team_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    sync_cid = (
+        update.effective_chat.id
+        if update.effective_chat and update.effective_chat.id < 0
+        else get_work_group_id()
+    )
+    await refresh_group_admins(context.bot, sync_cid)
     members = await asyncio.to_thread(get_team_members)
     tagged = {m.lower() for m in await asyncio.to_thread(get_tagged_assistants)}
     if not members:
         await update.message.reply_text(
-            "No assistants detected yet. Make the bot Admin in the work group, send any message, or use <code>/tags</code>.",
+            "No non-admin assistants detected yet. Assistants are auto-detected when they message in the work group.",
             parse_mode="HTML",
         )
         return
-    lines = ["Recognized Assistants / Team Roster:"]
+    lines = ["Recognized Assistants (Non-Admin Roster):"]
     for m in members:
         badge = " (Tag: ON)" if m.lower() in tagged else " (Tag: OFF)"
         lines.append(f"- {m}{badge}")
@@ -2364,6 +2601,7 @@ async def send_slot_open_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     if work_group_id is None:
         return
 
+    await refresh_group_admins(context.bot, work_group_id)
     slot_label = str(context.job.data)
     tagged_pairs = await asyncio.to_thread(get_tagged_assistants_with_ids)
     tags_line = " ".join(_format_mention_html(u, uid) for u, uid in tagged_pairs)
@@ -2398,6 +2636,7 @@ async def send_slot_final_warning_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     if work_group_id is None:
         return
 
+    await refresh_group_admins(context.bot, work_group_id)
     slot_label = str(context.job.data)
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     pending = await asyncio.to_thread(
@@ -2429,10 +2668,103 @@ def _extract_username(update: Update) -> Optional[str]:
     return f"@{user.username}" if user.username else (user.first_name or "Unknown User")
 
 
+async def refresh_group_admins(
+    bot, chat_id: Optional[int] = None, force: bool = False
+) -> None:
+    """Fetch Telegram Group Admins & purge them from assistant tags/roster so only non-admin Assistants are tagged."""
+    target_cid = chat_id if (chat_id is not None and chat_id < 0) else get_work_group_id()
+    if target_cid is None or target_cid >= 0:
+        return
+
+    now_ist = datetime.now(IST)
+    last_sync = _ADMIN_SYNC_CACHE.get(target_cid)
+    if not force and last_sync is not None and (now_ist - last_sync).total_seconds() < 120:
+        return
+
+    _ADMIN_SYNC_CACHE[target_cid] = now_ist
+    try:
+        admins = await bot.get_chat_administrators(target_cid)
+    except Exception as exc:
+        logger.debug("Could not fetch chat administrators for %s: %s", target_cid, exc)
+        return
+
+    pairs: list[tuple[Optional[int], str]] = []
+    seen_ids: set[int] = set()
+    for member in admins:
+        u = member.user
+        if not u or u.is_bot:
+            continue
+        uname = f"@{u.username}" if u.username else (u.first_name or f"Admin({u.id})")
+        pairs.append((u.id, uname))
+        seen_ids.add(u.id)
+
+    if DEFAULT_ADMIN_CHAT_ID is not None and DEFAULT_ADMIN_CHAT_ID not in seen_ids:
+        pairs.append((DEFAULT_ADMIN_CHAT_ID, ""))
+
+    purged = await asyncio.to_thread(sync_group_admins, pairs)
+    if purged > 0:
+        logger.info("Purged %s Group Admin entries from assistant tags/roster.", purged)
+
+
+async def send_celebration_reaction(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    is_late: bool = False,
+) -> None:
+    """
+    React to valid report messages with big full-screen popup animation (is_big=True).
+    Tries multiple celebratory emojis first and falls back to a single big emoji if the chat caps bot reactions at 1.
+    """
+    if ReactionTypeEmoji is None:
+        return
+
+    if is_late:
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji("👍")],
+                is_big=True,
+            )
+        except Exception:
+            pass
+        return
+
+    multi = [
+        ReactionTypeEmoji("🔥"),
+        ReactionTypeEmoji("🎉"),
+        ReactionTypeEmoji("💯"),
+    ]
+    try:
+        await context.bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=multi,
+            is_big=True,
+        )
+        return
+    except Exception:
+        pass
+
+    chosen = _CELEBRATION_EMOJIS[message_id % len(_CELEBRATION_EMOJIS)]
+    for candidate in (chosen, "🔥", "👍"):
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji(candidate)],
+                is_big=True,
+            )
+            return
+        except Exception:
+            continue
+
+
 async def handle_any_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Runs in handler group=-1 on EVERY work-group message (text, photo, command, join)
-    so the bot automatically recognizes any assistant immediately.
+    so non-admin assistants are auto-recognized and Group Admins are always excluded.
     """
     message = update.message
     user = update.effective_user
@@ -2446,22 +2778,25 @@ async def handle_any_group_message(update: Update, context: ContextTypes.DEFAULT
         return
 
     if work_group_id is not None and chat.id != work_group_id:
-        logger.info("Auto-discover skipped: chat_id=%s != work_group_id=%s", chat.id, work_group_id)
         return
+
+    await refresh_group_admins(context.bot, chat.id)
 
     if message.new_chat_members:
         for member in message.new_chat_members:
-            if member.is_bot or (DEFAULT_ADMIN_CHAT_ID is not None and member.id == DEFAULT_ADMIN_CHAT_ID):
+            if member.is_bot:
                 continue
             m_name = f"@{member.username}" if member.username else (member.first_name or "Unknown")
+            if is_known_group_admin(m_name, member.id):
+                continue
             newly = await asyncio.to_thread(auto_discover_assistant, m_name, member.id)
             if newly:
                 logger.info("Auto-recognized new group member as assistant: %s", m_name)
 
-    if DEFAULT_ADMIN_CHAT_ID is not None and user.id == DEFAULT_ADMIN_CHAT_ID:
+    username = _extract_username(update)
+    if is_known_group_admin(username or "", user.id):
         return
 
-    username = _extract_username(update)
     if username:
         newly = await asyncio.to_thread(auto_discover_assistant, username, user.id)
         if newly:
@@ -2470,10 +2805,8 @@ async def handle_any_group_message(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Record Username, Joining, Timing & Caption ONLY (no photo storage needed).
-    Triggered by BOTH:
-      1) Photo/image messages with or without caption during active slot windows
-      2) Text messages containing Joining count (e.g. 'Username- @...\nJoining- 40') during active slots
+    Record Username, Joining, Timing & Caption ONLY for non-admin assistants when caption matches report format.
+    Random photos, admin photos, and messages without Username/Joining are silently ignored (zero reply spam).
     """
     message = update.message
     user = update.effective_user
@@ -2482,11 +2815,10 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not message or not user or not chat or user.is_bot:
         return
 
-    is_media = bool(message.photo or (message.document and (message.document.mime_type or "").startswith("image/")))
     raw_caption = (message.caption or message.text or "").strip()
 
-    # Ignore normal chat messages like "Hi" or "Ok" unless they are media or match report format ("Joining ...")
-    if not is_media and not is_text_report_message(raw_caption):
+    # Ignore random photos, blank screenshots, leaderboards, and casual chats that are NOT a report format
+    if not is_report_caption(raw_caption):
         return
 
     work_group_id = get_work_group_id()
@@ -2510,7 +2842,12 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         return
 
-    fallback_user = _extract_username(update) or "Unknown User"
+    await refresh_group_admins(context.bot, chat.id)
+    sender_label = _extract_username(update) or ""
+    if is_known_group_admin(sender_label, user.id):
+        return
+
+    fallback_user = sender_label or "Unknown User"
     username, joining = parse_report_fields(raw_caption, fallback_user)
     effective_uid = user.id if username.lower() == fallback_user.lower() else None
 
@@ -2525,12 +2862,17 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if mg_key in _SEEN_MEDIA_GROUPS:
                 return
             _SEEN_MEDIA_GROUPS[mg_key] = datetime.now(IST)
-        await message.reply_text(
-            f"Not recorded ({submission_time}): Reports are ONLY recorded during slot windows.\n"
-            f"Active IST Slots: 10:00-10:15 AM, 1:00-1:15 PM, 3:00-3:15 PM, 5:00-5:15 PM, and 7:30-8:15 PM.\n"
-            f"(Admin can reply /add to this message to record it anyway.)",
-            reply_to_message_id=message.message_id,
-        )
+        # Quiet reaction only (no noisy reply spam outside slot hours)
+        if ReactionTypeEmoji is not None:
+            try:
+                await context.bot.set_message_reaction(
+                    chat_id=chat.id,
+                    message_id=message.message_id,
+                    reaction=[ReactionTypeEmoji("⏳")],
+                    is_big=False,
+                )
+            except Exception:
+                pass
         return
 
     async with _REPORT_LOCK:
@@ -2589,6 +2931,8 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
+    await send_celebration_reaction(context, chat.id, message.message_id, is_late=False)
+
     excel_caption = (
         f"Excel Updated | {username} | Joining: {joining or 'N/A'} | {active_slot}\n"
         f"Time: {submission_time} | Date: {report_date} | Status: {status}"
@@ -2598,15 +2942,18 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await push_excel_to_group(context, target_date=report_date, caption=excel_caption)
 
     join_line = f"\nJoining: {joining}" if joining else ""
-    note_line = f"\nCaption: {raw_caption}" if raw_caption else ""
-    label_verb = "updated" if action == "updated" else "recorded"
+    label_verb = "Updated" if action == "updated" else "Recorded"
     confirmation = (
-        f"Report {label_verb} for {username}.{join_line}\n"
-        f"Slot: {active_slot}\n"
-        f"Time: {submission_time} | Date: {report_date}\n"
-        f"Status: {status}{note_line}"
+        f"🎉🔥💯 🏆 ✅ <b>Report {label_verb}!</b>\n"
+        f"Assistant: <code>{html.escape(username)}</code>{join_line}\n"
+        f"Slot: {html.escape(active_slot)}\n"
+        f"Time: {html.escape(submission_time)} | Status: <b>{status}</b>"
     )
-    await message.reply_text(confirmation, reply_to_message_id=message.message_id)
+    await message.reply_text(
+        confirmation,
+        parse_mode="HTML",
+        reply_to_message_id=message.message_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2660,6 +3007,9 @@ async def auto_restore_from_excel_group(application: Application) -> None:
 
 async def post_init(application: Application) -> None:
     await auto_restore_from_excel_group(application)
+    work_gid = get_work_group_id()
+    if work_gid is not None:
+        await refresh_group_admins(application.bot, work_gid, force=True)
 
     if application.job_queue is None:
         return

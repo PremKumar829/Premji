@@ -164,12 +164,12 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
   {
     command: '/add [10am|1pm|3pm|5pm|final]',
     scope: 'Admin (Reply to msg)',
-    description: 'Reply to any already-sent report in the group to record its Username, Joining, and original IST timing.',
+    description: 'Reply to any already-sent report in the group to record Username, Joining & original IST timing (marks Late if past slot cutoff).',
   },
   {
-    command: '/addreport @user 40 [10am]',
+    command: '/addreport @user 40 [10am] [10:05]',
     scope: 'Admin Only',
-    description: 'Manually add or bulk-paste multiple past reports into SQLite and Excel in one message.',
+    description: 'Manually add or bulk-paste past reports into SQLite and Excel (auto-marks On Time vs Late from timestamp).',
   },
   {
     command: '/check',
