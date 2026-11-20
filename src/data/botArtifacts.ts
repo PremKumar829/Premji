@@ -56,11 +56,11 @@ export const REPORTING_SLOTS: ReportingSlot[] = [
   {
     id: 'final',
     label: 'Final Report (Before 8:00 PM)',
-    shortLabel: 'Final (<8 PM)',
+    shortLabel: 'Final (7:15-8 PM)',
     targetDisplay: 'Before 8:00 PM',
-    windowDisplay: '07:30:00 PM - 08:15:59 PM IST',
-    startSec: toSeconds(19, 30, 0),
-    endSec: toSeconds(20, 15, 59),
+    windowDisplay: '07:15:00 PM - 08:00:59 PM IST',
+    startSec: toSeconds(19, 15, 0),
+    endSec: toSeconds(20, 0, 59),
   },
 ];
 
@@ -189,12 +189,12 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
   {
     command: '/countdown [10am|1pm|3pm|5pm|final|stop]',
     scope: 'Admin Only',
-    description: 'Manually starts or stops the live 15-minute animated penalty countdown (before 00:00 = ₹5, after 00:00 = ₹15).',
+    description: 'Starts/stops the live 15-min animated countdown (7:45 PM Final Warning or manual regular slot; Regular Late = ₹5, Final Late >8 PM = ₹10, Missed = ₹15).',
   },
   {
     command: '/reminder on | off',
     scope: 'Admin Only',
-    description: 'Turns scheduled assistant-tagging reminders, 5-min warnings, and 15-min ₹5/₹15 countdowns ON or OFF live.',
+    description: 'Turns scheduled slot open alerts (7:15 PM Final), 7:45 PM animated countdown, and 8:00 PM Last Warning ON or OFF live.',
   },
   {
     command: '/setexcelgroup',
@@ -209,17 +209,17 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
   {
     command: '/excel [YYYY-MM-DD]',
     scope: 'Admin / Group',
-    description: 'Generates and sends the 5-sheet .xlsx workbook (including Penalty ₹5 / ₹15 columns) for today or a specific date.',
+    description: 'Generates and sends the 5-sheet .xlsx workbook (Regular Late ₹5, Final Late ₹10, Missed ₹15 columns) for today or a specific date.',
   },
   {
     command: '/weekly',
     scope: 'Admin / Group',
-    description: 'Sends a 7-day consolidated Excel workbook with Total Joining, Penalties, and Member Compliance %.',
+    description: 'Sends a 7-day consolidated Excel workbook with Total Joining, Penalties (₹5/₹10/₹15), and Member Compliance %.',
   },
   {
     command: '/summary & /mystatus',
     scope: 'Group / DM',
-    description: 'Shows live slot submission counts, total joining, ₹5/₹15 penalty totals, and an interactive button to remove/restore assistant names.',
+    description: 'Shows live slot submission counts, total joining, ₹5/₹10 late + ₹15 missed penalty totals, and an interactive button to remove/restore assistant names.',
   },
   {
     command: '/removesummary @user | /restoresummary @user',

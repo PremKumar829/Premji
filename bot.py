@@ -5,14 +5,12 @@ Deployable directly via GitHub + Render Free Tier (no Google Sheets / external D
 Core Behavior:
   1. Excel-Only Delivery: Sends formatted .xlsx workbook (team_report_YYYY-MM-DD.xlsx)
      to your Excel/Backup Group on every recorded slot submission AND at 8:35 PM IST to Admin DM.
-  2. Auto-Recognize Assistants: When any non-admin member sends ANY message in the work group
-     (or joins), the bot automatically registers them as an assistant and enables tagging
-     (unless manually turned OFF via /tags or /removetag). Group Admins are automatically excluded.
-  3. Slot Timing + 15-Min Animated Penalty Countdown:
-     - First 15 mins (On-Time window): Recorded as On Time (₹0).
-     - After 15 mins: Tags pending non-admin assistants and runs a 15-minute animated countdown.
-       Submitting before countdown ends (00:00) incurs ₹5 Penalty ONLY.
-       Submitting after countdown ends (00:00) incurs ₹15 Penalty.
+  2. Auto-Recognize Assistants (Case-Insensitive): Deduplicates username variants like
+     @PREMGUPTA2M and @Premgupta2m into one canonical assistant; auto-excludes Group Admins.
+  3. Slot Timing, Countdown & Penalties:
+     - Regular Slots (10 AM, 1 PM, 3 PM, 5 PM): On Time (15m) = ₹0 | Late (after 15m) = ₹5 | Missed = ₹15
+     - Final Report (7:15 PM – 8:00 PM): On Time = ₹0 | 7:45 PM Final Warning + 15m Countdown |
+       8:00 PM Last Warning | Late after 8:00 PM = ₹10 | Missed = ₹15
   4. Safe HTML formatting + user_id mention fallback + full edited-caption & album support.
 
 Requires: python-telegram-bot[job-queue] >= 21.0, openpyxl >= 3.1.5, python-dotenv, tzdata
@@ -98,11 +96,12 @@ PREVENT_DUPLICATE_SLOTS = os.getenv("PREVENT_DUPLICATE_SLOTS", "true").strip().l
 
 DB_PATH = os.getenv("DB_PATH", "reports.db").strip()
 IST = ZoneInfo("Asia/Kolkata")
-DAILY_SEND_TIME_IST = time(hour=20, minute=35, second=0, tzinfo=IST)  # 8:35 PM IST (after Final ₹5 countdown)
+DAILY_SEND_TIME_IST = time(hour=20, minute=35, second=0, tzinfo=IST)  # 8:35 PM IST
 COUNTDOWN_DURATION_SECS = 15 * 60
 COUNTDOWN_REFRESH_SECS = 15
-PENALTY_COUNTDOWN_RS = 5
-PENALTY_AFTER_COUNTDOWN_RS = 15
+PENALTY_LATE_REGULAR_RS = 5
+PENALTY_LATE_FINAL_RS = 10
+PENALTY_MISSED_RS = 15
 
 _REPORT_LOCK = asyncio.Lock()
 _SEEN_MEDIA_GROUPS: dict[str, datetime] = {}
@@ -114,15 +113,15 @@ _CELEBRATION_EMOJIS: tuple[str, ...] = ("🔥", "🎉", "💯", "🏆", "⚡", "
 
 
 # ---------------------------------------------------------------------------
-# Reporting Slot Definitions (IST) with 15-Minute Grace Period
+# Reporting Slot Definitions (IST)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ReportingSlot:
     label: str
     start: time
-    end: time  # Inclusive end of window (includes 15-minute grace period)
+    end: time  # Inclusive end of On-Time window
     reminder_time: time  # Slot-open reminder + tag warning
-    final_warning_time: time  # 5-minute warning before grace closes
+    final_warning_time: time  # Warning before On-Time closes (7:45 PM with countdown for Final)
 
 
 REPORTING_SLOTS: tuple[ReportingSlot, ...] = (
@@ -132,12 +131,13 @@ REPORTING_SLOTS: tuple[ReportingSlot, ...] = (
     ReportingSlot("5:00 PM Slot", time(17, 0, 0), time(17, 15, 59), time(17, 0, 0), time(17, 10, 0)),
     ReportingSlot(
         "Final Report (Before 8:00 PM)",
-        time(19, 30, 0),
-        time(20, 15, 59),
+        time(19, 15, 0),
+        time(20, 0, 59),
+        time(19, 15, 0),
         time(19, 45, 0),
-        time(20, 10, 0),
     ),
 )
+FINAL_SLOT_LABEL = REPORTING_SLOTS[4].label
 
 
 def detect_active_slot(ist_dt: datetime) -> Optional[str]:
@@ -205,12 +205,35 @@ def _time_to_secs(t: time) -> int:
     return t.hour * 3600 + t.minute * 60 + t.second
 
 
+def _is_final_slot(slot_label: str) -> bool:
+    return slot_label == FINAL_SLOT_LABEL
+
+
+def _late_penalty_for_slot(slot_label: str) -> int:
+    return PENALTY_LATE_FINAL_RS if _is_final_slot(slot_label) else PENALTY_LATE_REGULAR_RS
+
+
+def get_closed_slots_for_date(
+    target_date: str, now_ist: Optional[datetime] = None
+) -> list[ReportingSlot]:
+    """Return slots whose On-Time deadline has already closed on target_date."""
+    ref = now_ist or datetime.now(IST)
+    today_str = ref.strftime("%Y-%m-%d")
+    if target_date < today_str:
+        return list(REPORTING_SLOTS)
+    if target_date > today_str:
+        return []
+    cur_sec = _time_to_secs(ref.time().replace(tzinfo=None))
+    return [s for s in REPORTING_SLOTS if cur_sec > _time_to_secs(s.end)]
+
+
 def evaluate_slot_status_and_penalty(ist_dt: datetime, slot_label: str) -> tuple[str, int]:
     """
-    Evaluate Status and Penalty (₹0, ₹5, ₹15) for a submission against a given slot:
+    Evaluate Status and Penalty (₹0 / ₹5 / ₹10) for a submitted report:
       - Within [slot.start, slot.end] (or <= 15m early): On Time, ₹0
-      - Within 15-min countdown (slot.end + 1s .. slot.end + 15m): Late (₹5 Penalty), ₹5
-      - After 15-min countdown ends (> slot.end + 15m): Late (₹15 Penalty), ₹15
+      - Late on regular slots (10am, 1pm, 3pm, 5pm after :15:59): Late (₹5 Penalty), ₹5
+      - Late on Final Report (after 8:00 PM / 20:00:59): Late (₹10 Penalty), ₹10
+    (Completely unsubmitted closed slots incur ₹15 Missed Penalty in summary/Excel.)
     """
     slot = _get_slot_by_label(slot_label)
     if not slot:
@@ -218,15 +241,13 @@ def evaluate_slot_status_and_penalty(ist_dt: datetime, slot_label: str) -> tuple
     cur_sec = _time_to_secs(ist_dt.time().replace(tzinfo=None))
     start_sec = _time_to_secs(slot.start)
     end_sec = _time_to_secs(slot.end)
-    countdown_end_sec = end_sec + COUNTDOWN_DURATION_SECS
 
     if start_sec <= cur_sec <= end_sec:
         return "On Time", 0
     if 0 <= (start_sec - cur_sec) <= 900:
         return "On Time", 0
-    if end_sec < cur_sec <= countdown_end_sec:
-        return f"Late (₹{PENALTY_COUNTDOWN_RS} Penalty)", PENALTY_COUNTDOWN_RS
-    return f"Late (₹{PENALTY_AFTER_COUNTDOWN_RS} Penalty)", PENALTY_AFTER_COUNTDOWN_RS
+    pen = _late_penalty_for_slot(slot_label)
+    return f"Late (₹{pen} Penalty)", pen
 
 
 def evaluate_slot_status(ist_dt: datetime, slot_label: str) -> str:
@@ -243,15 +264,13 @@ def evaluate_slot_status_from_strings_with_penalty(
     cur_sec = _time_to_secs(parsed_t)
     start_sec = _time_to_secs(slot.start)
     end_sec = _time_to_secs(slot.end)
-    countdown_end_sec = end_sec + COUNTDOWN_DURATION_SECS
 
     if start_sec <= cur_sec <= end_sec:
         return "On Time", 0
     if 0 <= (start_sec - cur_sec) <= 900:
         return "On Time", 0
-    if end_sec < cur_sec <= countdown_end_sec:
-        return f"Late (₹{PENALTY_COUNTDOWN_RS} Penalty)", PENALTY_COUNTDOWN_RS
-    return f"Late (₹{PENALTY_AFTER_COUNTDOWN_RS} Penalty)", PENALTY_AFTER_COUNTDOWN_RS
+    pen = _late_penalty_for_slot(slot_label)
+    return f"Late (₹{pen} Penalty)", pen
 
 
 def evaluate_slot_status_from_strings(submission_time: str, slot_label: str) -> str:
@@ -261,7 +280,7 @@ def evaluate_slot_status_from_strings(submission_time: str, slot_label: str) -> 
 def resolve_submission_slot_and_penalty(ist_dt: datetime) -> tuple[Optional[str], str, int]:
     """
     Map ANY report submission time (>= 10:00 AM IST) to the active or most-recent slot
-    with exact ₹0 / ₹5 / ₹15 penalty status so valid reports after 15 mins are NEVER dropped.
+    with exact ₹0 / ₹5 (regular late) / ₹10 (final after 8 PM) penalty status.
     """
     cur_sec = _time_to_secs(ist_dt.time().replace(tzinfo=None))
 
@@ -282,7 +301,7 @@ def resolve_submission_slot_and_penalty(ist_dt: datetime) -> tuple[Optional[str]
 
 
 def recalculate_report_statuses(conn: sqlite3.Connection) -> int:
-    """Auto-sync status and ₹5/₹15 penalty on existing/restored rows based on submission_time."""
+    """Auto-sync status and ₹5/₹10 late penalty on existing/restored rows based on submission_time."""
     fixed = 0
     cols = {row[1] for row in conn.execute("PRAGMA table_info(reports)").fetchall()}
     has_pen = "penalty_rs" in cols
@@ -491,8 +510,124 @@ def init_db() -> None:
                         (norm, now_iso),
                     )
 
+        deduplicate_case_insensitive_records(conn)
         recalculate_report_statuses(conn)
         conn.commit()
+
+
+def _pick_canonical_username(names: list[str]) -> str:
+    """Choose the best display username among case variants (e.g. @Premgupta2m over PREMGUPTA2M)."""
+    cleaned = [n.strip() for n in names if n and n.strip()]
+    if not cleaned:
+        return ""
+
+    def _score(name: str) -> tuple[int, int, int]:
+        has_at = 1 if name.startswith("@") else 0
+        is_mixed = 1 if (name != name.upper() and name != name.lower()) else (0 if name != name.upper() else -1)
+        return (has_at, is_mixed, len(name))
+
+    return max(cleaned, key=_score)
+
+
+def deduplicate_case_insensitive_records(conn: sqlite3.Connection) -> int:
+    """
+    Merge case-variant duplicates across team_members, assistant_tags, summary_excluded, and reports
+    (e.g. @PREMGUPTA2M + @Premgupta2m -> single canonical row) so assistants are never marked Missed twice.
+    """
+    removed = 0
+
+    # 1. Deduplicate team_members
+    tm_rows = conn.execute("SELECT rowid, username, user_id, added_at FROM team_members").fetchall()
+    tm_groups: dict[str, list[tuple[int, str, Optional[int], str]]] = {}
+    for rowid, uname, uid, added_at in tm_rows:
+        k = (uname or "").strip().lstrip("@").lower()
+        if k:
+            tm_groups.setdefault(k, []).append((rowid, uname, uid, added_at))
+    for k, grp in tm_groups.items():
+        if len(grp) > 1 or any(g[1] != grp[0][1] for g in grp):
+            canon = _pick_canonical_username([g[1] for g in grp])
+            best_uid = next((g[2] for g in grp if g[2] is not None), None)
+            best_added = min(str(g[3] or "") for g in grp)
+            keep_id = grp[0][0]
+            for rid, _, _, _ in grp[1:]:
+                conn.execute("DELETE FROM team_members WHERE rowid = ?", (rid,))
+                removed += 1
+            conn.execute(
+                "UPDATE team_members SET username = ?, user_id = ?, added_at = ? WHERE rowid = ?",
+                (canon, best_uid, best_added, keep_id),
+            )
+
+    # 2. Deduplicate assistant_tags
+    at_rows = conn.execute("SELECT rowid, username, user_id, is_active, added_at FROM assistant_tags").fetchall()
+    at_groups: dict[str, list[tuple[int, str, Optional[int], int, str]]] = {}
+    for rowid, uname, uid, is_act, added_at in at_rows:
+        k = (uname or "").strip().lstrip("@").lower()
+        if k:
+            at_groups.setdefault(k, []).append((rowid, uname, uid, int(is_act or 0), added_at))
+    for k, grp in at_groups.items():
+        if len(grp) > 1:
+            canon = _pick_canonical_username([g[1] for g in grp])
+            best_uid = next((g[2] for g in grp if g[2] is not None), None)
+            best_act = 1 if any(g[3] == 1 for g in grp) else 0
+            best_added = min(str(g[4] or "") for g in grp)
+            keep_id = grp[0][0]
+            for rid, _, _, _, _ in grp[1:]:
+                conn.execute("DELETE FROM assistant_tags WHERE rowid = ?", (rid,))
+                removed += 1
+            conn.execute(
+                "UPDATE assistant_tags SET username = ?, user_id = ?, is_active = ?, added_at = ? WHERE rowid = ?",
+                (canon, best_uid, best_act, best_added, keep_id),
+            )
+
+    # 3. Deduplicate summary_excluded
+    se_rows = conn.execute("SELECT rowid, username FROM summary_excluded").fetchall()
+    seen_se: set[str] = set()
+    for rowid, uname in se_rows:
+        k = (uname or "").strip().lstrip("@").lower()
+        if k in seen_se:
+            conn.execute("DELETE FROM summary_excluded WHERE rowid = ?", (rowid,))
+            removed += 1
+        elif k:
+            seen_se.add(k)
+
+    # 4. Canonicalize and deduplicate reports on (key, report_date, reporting_slot)
+    canon_map: dict[str, str] = {}
+    for (uname,) in conn.execute("SELECT username FROM team_members").fetchall():
+        k = (uname or "").strip().lstrip("@").lower()
+        if k:
+            canon_map[k] = uname
+    for (uname,) in conn.execute("SELECT username FROM assistant_tags").fetchall():
+        k = (uname or "").strip().lstrip("@").lower()
+        if k and k not in canon_map:
+            canon_map[k] = uname
+
+    rep_rows = conn.execute(
+        "SELECT id, username, COALESCE(joining, ''), user_id, report_date, reporting_slot FROM reports ORDER BY id ASC"
+    ).fetchall()
+    rep_groups: dict[tuple[str, str, str], list[tuple[int, str, str, Optional[int]]]] = {}
+    for rid, uname, joining, uid, rdate, rslot in rep_rows:
+        k = (uname or "").strip().lstrip("@").lower()
+        if not k:
+            continue
+        rep_groups.setdefault((k, str(rdate), str(rslot)), []).append((rid, uname, joining, uid))
+
+    for (k, _d, _s), grp in rep_groups.items():
+        canon = canon_map.get(k) or _pick_canonical_username([g[1] for g in grp])
+        if len(grp) > 1:
+            grp_sorted = sorted(grp, key=lambda g: (1 if g[2] else 0, 1 if g[3] is not None else 0, g[0]), reverse=True)
+            keep_rid = grp_sorted[0][0]
+            best_uid = next((g[3] for g in grp_sorted if g[3] is not None), None)
+            for rid, _, _, _ in grp_sorted[1:]:
+                conn.execute("DELETE FROM reports WHERE id = ?", (rid,))
+                removed += 1
+            conn.execute(
+                "UPDATE reports SET username = ?, user_id = COALESCE(user_id, ?) WHERE id = ?",
+                (canon, best_uid, keep_rid),
+            )
+        elif grp[0][1] != canon:
+            conn.execute("UPDATE reports SET username = ? WHERE id = ?", (canon, grp[0][0]))
+
+    return removed
 
 
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -676,10 +811,70 @@ def sync_group_admins(admin_pairs: list[tuple[Optional[int], str]]) -> int:
     return removed
 
 
+def _upsert_team_member_case_insensitive(
+    conn: sqlite3.Connection, username: str, user_id: Optional[int], now_iso: str
+) -> tuple[bool, str]:
+    clean = username.strip()
+    key = _match_key(clean)
+    if not clean or not key:
+        return False, clean
+    existing = conn.execute(
+        "SELECT rowid, username, user_id FROM team_members WHERE LOWER(LTRIM(username, '@')) = ? LIMIT 1",
+        (key,),
+    ).fetchone()
+    if existing:
+        canon = _pick_canonical_username([existing[1], clean])
+        new_uid = user_id if user_id is not None else existing[2]
+        if canon != existing[1] or new_uid != existing[2]:
+            conn.execute(
+                "UPDATE team_members SET username = ?, user_id = COALESCE(?, user_id) WHERE rowid = ?",
+                (canon, new_uid, existing[0]),
+            )
+        return False, canon
+    conn.execute(
+        "INSERT OR IGNORE INTO team_members (username, user_id, added_at) VALUES (?, ?, ?)",
+        (clean, user_id, now_iso),
+    )
+    return True, clean
+
+
+def _upsert_assistant_tag_case_insensitive(
+    conn: sqlite3.Connection,
+    username: str,
+    user_id: Optional[int],
+    now_iso: str,
+    force_active: Optional[int] = None,
+) -> tuple[bool, str]:
+    clean = username.strip()
+    key = _match_key(clean)
+    if not clean or not key:
+        return False, clean
+    existing = conn.execute(
+        "SELECT rowid, username, user_id, is_active FROM assistant_tags WHERE LOWER(LTRIM(username, '@')) = ? LIMIT 1",
+        (key,),
+    ).fetchone()
+    if existing:
+        canon = _pick_canonical_username([existing[1], clean])
+        new_uid = user_id if user_id is not None else existing[2]
+        new_act = force_active if force_active is not None else int(existing[3])
+        if canon != existing[1] or new_uid != existing[2] or new_act != int(existing[3]):
+            conn.execute(
+                "UPDATE assistant_tags SET username = ?, user_id = COALESCE(?, user_id), is_active = ? WHERE rowid = ?",
+                (canon, new_uid, new_act, existing[0]),
+            )
+        return False, canon
+    act_val = 1 if force_active is None else force_active
+    conn.execute(
+        "INSERT OR IGNORE INTO assistant_tags (username, user_id, is_active, added_at) VALUES (?, ?, ?, ?)",
+        (clean, user_id, act_val, now_iso),
+    )
+    return True, clean
+
+
 def auto_discover_assistant(username: str, user_id: Optional[int] = None) -> bool:
     """
     Automatically register any non-admin group member as an assistant on their first message.
-    Blocks Group Admins and respects summary_excluded so removed members stay excluded.
+    Case-insensitive deduplication prevents @PREMGUPTA2M + @Premgupta2m duplicates.
     """
     clean = username.strip()
     key = _match_key(clean)
@@ -694,25 +889,10 @@ def auto_discover_assistant(username: str, user_id: Optional[int] = None) -> boo
             (key,),
         ).fetchone():
             return False
-        conn.execute(
-            "INSERT OR IGNORE INTO team_members (username, user_id, added_at) VALUES (?, ?, ?)",
-            (clean, user_id, now_iso),
-        )
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO assistant_tags (username, user_id, is_active, added_at) VALUES (?, ?, 1, ?)",
-            (clean, user_id, now_iso),
-        )
-        if user_id is not None:
-            conn.execute(
-                "UPDATE team_members SET user_id = ? WHERE username = ? AND user_id IS NULL",
-                (user_id, clean),
-            )
-            conn.execute(
-                "UPDATE assistant_tags SET user_id = ? WHERE username = ? AND user_id IS NULL",
-                (user_id, clean),
-            )
+        _, canon = _upsert_team_member_case_insensitive(conn, clean, user_id, now_iso)
+        inserted, _ = _upsert_assistant_tag_case_insensitive(conn, canon, user_id, now_iso)
         conn.commit()
-        return cur.rowcount > 0
+        return inserted
 
 
 def add_team_member(username: str) -> bool:
@@ -720,17 +900,15 @@ def add_team_member(username: str) -> bool:
     key = _match_key(clean)
     if not clean or not key:
         return False
+    now_iso = datetime.now(IST).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "DELETE FROM summary_excluded WHERE LOWER(LTRIM(username, '@')) = ?",
             (key,),
         )
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO team_members (username, user_id, added_at) VALUES (?, NULL, ?)",
-            (clean, datetime.now(IST).isoformat()),
-        )
+        inserted, _ = _upsert_team_member_case_insensitive(conn, clean, None, now_iso)
         conn.commit()
-        return cur.rowcount > 0
+        return inserted
 
 
 def remove_team_member(username: str) -> bool:
@@ -768,11 +946,12 @@ def get_team_members() -> list[str]:
         rows = conn.execute(
             "SELECT username, user_id FROM team_members ORDER BY username ASC"
         ).fetchall()
-    return [
+    filtered = [
         u
         for u, uid in rows
         if (uid is None or uid not in admin_ids) and _match_key(u) not in admin_keys
     ]
+    return _dedup_case_insensitive(filtered)
 
 
 def get_tagged_assistants_with_ids() -> list[tuple[str, Optional[int]]]:
@@ -781,11 +960,20 @@ def get_tagged_assistants_with_ids() -> list[tuple[str, Optional[int]]]:
         rows = conn.execute(
             "SELECT username, user_id FROM assistant_tags WHERE is_active = 1 ORDER BY username ASC"
         ).fetchall()
-    return [
-        (u, uid)
-        for u, uid in rows
-        if (uid is None or uid not in admin_ids) and _match_key(u) not in admin_keys
-    ]
+    by_key: dict[str, tuple[str, Optional[int]]] = {}
+    for u, uid in rows:
+        key = _match_key(u)
+        if not key or key in admin_keys or (uid is not None and uid in admin_ids):
+            continue
+        if key not in by_key:
+            by_key[key] = (u, uid)
+        else:
+            prev_u, prev_uid = by_key[key]
+            by_key[key] = (
+                _pick_canonical_username([prev_u, u]),
+                uid if uid is not None else prev_uid,
+            )
+    return sorted(by_key.values(), key=lambda x: x[0].lower())
 
 
 def get_tagged_assistants() -> list[str]:
@@ -798,30 +986,20 @@ def add_assistant_tag(username: str) -> bool:
         return False
     now_iso = datetime.now(IST).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO assistant_tags (username, user_id, is_active, added_at) VALUES (?, NULL, 1, ?)
-            ON CONFLICT(username) DO UPDATE SET is_active = 1
-            """,
-            (norm, now_iso),
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO team_members (username, user_id, added_at) VALUES (?, NULL, ?)",
-            (norm, now_iso),
-        )
+        _, canon = _upsert_assistant_tag_case_insensitive(conn, norm, None, now_iso, force_active=1)
+        _upsert_team_member_case_insensitive(conn, canon, None, now_iso)
         conn.commit()
         return True
 
 
 def remove_assistant_tag(username: str) -> bool:
-    norm = _normalize_tag(username)
+    key = _match_key(username)
+    if not key:
+        return False
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            """
-            UPDATE assistant_tags SET is_active = 0
-            WHERE LOWER(username) = LOWER(?) OR LOWER(username) = LOWER(?)
-            """,
-            (username.strip(), norm),
+            "UPDATE assistant_tags SET is_active = 0 WHERE LOWER(LTRIM(username, '@')) = ?",
+            (key,),
         )
         conn.commit()
         return cur.rowcount > 0
@@ -829,28 +1007,13 @@ def remove_assistant_tag(username: str) -> bool:
 
 def replace_assistant_tags(usernames: list[str]) -> list[str]:
     now_iso = datetime.now(IST).isoformat()
-    cleaned: list[str] = []
-    seen_lower: set[str] = set()
-    for raw in usernames:
-        norm = _normalize_tag(raw)
-        if norm and norm.lower() not in seen_lower:
-            seen_lower.add(norm.lower())
-            cleaned.append(norm)
+    cleaned = _dedup_case_insensitive([_normalize_tag(raw) for raw in usernames if _normalize_tag(raw)])
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("UPDATE assistant_tags SET is_active = 0")
         for norm in cleaned:
-            conn.execute(
-                """
-                INSERT INTO assistant_tags (username, user_id, is_active, added_at) VALUES (?, NULL, 1, ?)
-                ON CONFLICT(username) DO UPDATE SET is_active = 1
-                """,
-                (norm, now_iso),
-            )
-            conn.execute(
-                "INSERT OR IGNORE INTO team_members (username, user_id, added_at) VALUES (?, NULL, ?)",
-                (norm, now_iso),
-            )
+            _, canon = _upsert_assistant_tag_case_insensitive(conn, norm, None, now_iso, force_active=1)
+            _upsert_team_member_case_insensitive(conn, canon, None, now_iso)
         conn.commit()
     return cleaned
 
@@ -862,8 +1025,8 @@ def clear_assistant_tags() -> None:
 
 
 def toggle_assistant_tag(username: str) -> bool:
-    tagged_lower = {u.lower() for u in get_tagged_assistants()}
-    if username.lower() in tagged_lower:
+    tagged_keys = {_match_key(u) for u in get_tagged_assistants()}
+    if _match_key(username) in tagged_keys:
         remove_assistant_tag(username)
         return False
     add_assistant_tag(username)
@@ -924,6 +1087,7 @@ def upsert_report_to_db(
 ) -> str:
     key = _match_key(username)
     with sqlite3.connect(DB_PATH) as conn:
+        canonical = _resolve_canonical_name(conn, username) or username
         existing = conn.execute(
             """
             SELECT id, COALESCE(joining, ''), COALESCE(caption, '') FROM reports
@@ -942,6 +1106,7 @@ def upsert_report_to_db(
                     """
                     UPDATE reports
                     SET user_id = COALESCE(?, user_id),
+                        username = ?,
                         joining = ?,
                         submission_time = ?,
                         status = ?,
@@ -949,7 +1114,7 @@ def upsert_report_to_db(
                         caption = ?
                     WHERE id = ?
                     """,
-                    (user_id, new_joining, submission_time, status, penalty_rs, new_caption, row_id),
+                    (user_id, canonical, new_joining, submission_time, status, penalty_rs, new_caption, row_id),
                 )
                 conn.commit()
                 action = "updated"
@@ -964,7 +1129,7 @@ def upsert_report_to_db(
                 """,
                 (
                     user_id,
-                    username,
+                    canonical,
                     joining,
                     submission_time,
                     reporting_slot,
@@ -978,8 +1143,8 @@ def upsert_report_to_db(
             conn.commit()
             action = "inserted"
 
-    if not is_known_group_admin(username, user_id):
-        auto_discover_assistant(username, user_id=user_id)
+    if not is_known_group_admin(canonical, user_id):
+        auto_discover_assistant(canonical, user_id=user_id)
     return action
 
 
@@ -1077,7 +1242,7 @@ def _style_sheet(
             if status_val == "On Time":
                 status_cell.fill = on_time_fill
                 status_cell.font = on_time_font
-            elif "₹5" in status_val:
+            elif "₹5" in status_val or "₹10" in status_val:
                 status_cell.fill = warn5_fill
                 status_cell.font = warn5_font
             elif any(w in status_val.lower() for w in ("late", "missed", "outside", "₹15")):
@@ -1106,14 +1271,21 @@ def _dedup_case_insensitive(items: list[str]) -> list[str]:
         clean = item.strip()
         if not clean:
             continue
-        key = clean.lower()
-        if key not in seen or (clean != clean.lower() and seen[key] == seen[key].lower()):
+        key = _match_key(clean)
+        if not key:
+            continue
+        if key not in seen:
             seen[key] = clean
+        else:
+            seen[key] = _pick_canonical_username([seen[key], clean])
     return sorted(seen.values(), key=lambda x: x.lower())
 
 
 def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple[BytesIO, int]:
-    today_str = target_date or datetime.now(IST).strftime("%Y-%m-%d")
+    now_ist = datetime.now(IST)
+    today_str = target_date or now_ist.strftime("%Y-%m-%d")
+    closed_today_slots = get_closed_slots_for_date(today_str, now_ist)
+    closed_today_labels = {s.label for s in closed_today_slots}
 
     if days > 1:
         start_dt = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=days - 1)
@@ -1161,25 +1333,46 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
     ws_summary = wb.create_sheet(title="Member Summary")
     summary_rows: list[tuple[str, ...]] = []
     for member in members:
-        member_rows = [r for r in period_rows if _match_key(r[0]) == _match_key(member)]
+        m_key = _match_key(member)
+        member_rows = [r for r in period_rows if _match_key(r[0]) == m_key]
         on_time = sum(1 for r in member_rows if r[5] == "On Time")
-        late_5 = sum(1 for r in member_rows if r[6] == PENALTY_COUNTDOWN_RS)
-        late_15 = sum(1 for r in member_rows if r[6] >= PENALTY_AFTER_COUNTDOWN_RS)
+        late_5 = sum(1 for r in member_rows if r[6] == PENALTY_LATE_REGULAR_RS)
+        late_10 = sum(1 for r in member_rows if r[6] >= PENALTY_LATE_FINAL_RS)
         other_late = sum(1 for r in member_rows if r[5] != "On Time" and r[6] == 0)
-        total_pen = sum(r[6] for r in member_rows)
+        late_pen = sum(r[6] for r in member_rows)
         total_joining = sum(_safe_int(r[1]) for r in member_rows)
-        expected_slots = len(slot_labels) * days
-        missed = max(expected_slots - on_time - late_5 - late_15 - other_late, 0)
-        compliance = round((on_time / expected_slots) * 100) if expected_slots else 0
+
+        if days > 1:
+            start_dt = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=days - 1)
+            missed = 0
+            for d_idx in range(days):
+                d_str = (start_dt + timedelta(days=d_idx)).strftime("%Y-%m-%d")
+                d_closed = get_closed_slots_for_date(d_str, now_ist)
+                d_submitted = {r[3] for r in member_rows if r[4] == d_str}
+                missed += sum(1 for s in d_closed if s.label not in d_submitted)
+            expected_slots = sum(
+                len(get_closed_slots_for_date((start_dt + timedelta(days=i)).strftime("%Y-%m-%d"), now_ist))
+                for i in range(days)
+            )
+        else:
+            submitted_labels = {r[3] for r in member_rows}
+            missed = sum(1 for s in closed_today_slots if s.label not in submitted_labels)
+            expected_slots = len(closed_today_slots)
+
+        missed_pen = missed * PENALTY_MISSED_RS
+        total_pen = late_pen + missed_pen
+        compliance = round((on_time / expected_slots) * 100) if expected_slots else 100
         summary_rows.append(
             (
                 member,
                 str(total_joining),
                 str(on_time),
                 str(late_5),
-                str(late_15 + other_late),
-                f"₹{total_pen}",
+                str(late_10 + other_late),
                 str(missed),
+                f"₹{late_pen}",
+                f"₹{missed_pen}",
+                f"₹{total_pen}",
                 f"{compliance}%",
                 today_str,
             )
@@ -1192,9 +1385,11 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
             "Total Joining",
             "Submitted On Time",
             "Late (₹5)",
-            "Late (₹15)",
-            "Total Penalty",
+            "Final Late (₹10)",
             "Missed Slots",
+            "Late Penalty",
+            "Missed Penalty (₹15)",
+            "Total Penalty",
             "Compliance %",
             "Reference Date",
         ],
@@ -1221,12 +1416,14 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
                         f"Join: {j_val} ({t_val})" if j_val else f"On Time ({t_val})"
                     )
                 else:
-                    pen_tag = f"₹{pen_val}" if pen_val > 0 else st_val
+                    pen_tag = f"Late ₹{pen_val}" if pen_val > 0 else st_val
                     row_cells.append(
                         f"{pen_tag}: {j_val} ({t_val})" if j_val else f"{pen_tag} ({t_val})"
                     )
+            elif label in closed_today_labels:
+                row_cells.append(f"Missed (₹{PENALTY_MISSED_RS})")
             else:
-                row_cells.append("Missed")
+                row_cells.append("Pending")
         row_cells.append(str(day_joining))
         matrix_rows.append(tuple(row_cells))
 
@@ -1257,10 +1454,13 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
         team_rows = conn.execute(
             "SELECT username, user_id FROM team_members ORDER BY username ASC"
         ).fetchall()
-    tag_map = {u.lower(): (u, uid, act) for u, uid, act in tag_rows}
+    tag_map: dict[str, tuple[str, Optional[int], int]] = {}
+    for u, uid, act in tag_rows:
+        tag_map[_match_key(u)] = (u, uid, act)
     for u, uid in team_rows:
-        if u.lower() not in tag_map:
-            tag_map[u.lower()] = (u, uid, 0)
+        k = _match_key(u)
+        if k not in tag_map:
+            tag_map[k] = (u, uid, 0)
     for u, uid, act in sorted(tag_map.values(), key=lambda x: x[0].lower()):
         cfg_rows.append(("member_tag", u, f"active={act};user_id={uid if uid is not None else ''}"))
     for u in get_summary_excluded():
@@ -1433,6 +1633,7 @@ def restore_from_excel_bytes(excel_bytes: bytes) -> dict[str, object]:
                         (akey, uid_val, v or f"Admin({uid_val})", now_iso),
                     )
 
+        deduplicate_case_insensitive_records(conn)
         recalculate_report_statuses(conn)
         conn.commit()
 
@@ -1610,6 +1811,7 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                         (u_str, uid, now_iso),
                     )
 
+            deduplicate_case_insensitive_records(dst)
             recalculate_report_statuses(dst)
             dst.commit()
     finally:
@@ -1675,9 +1877,9 @@ async def push_excel_to_group(
 # Interactive Assistant Tag Menu Builder (/tags) — Safe HTML
 # ---------------------------------------------------------------------------
 def _build_tags_panel(current_chat_id: Optional[int] = None) -> tuple[str, InlineKeyboardMarkup]:
-    members = sorted(set(get_team_members()) | set(get_tagged_assistants()))
+    members = _dedup_case_insensitive(get_team_members() + get_tagged_assistants())
     tagged = get_tagged_assistants()
-    tagged_lower = {u.lower() for u in tagged}
+    tagged_keys = {_match_key(u) for u in tagged}
     rem_on = is_reminders_enabled()
     work_gid = get_work_group_id()
 
@@ -1702,7 +1904,7 @@ def _build_tags_panel(current_chat_id: Optional[int] = None) -> tuple[str, Inlin
     keyboard: list[list[InlineKeyboardButton]] = []
     row_buf: list[InlineKeyboardButton] = []
     for member in members[:30]:
-        is_tagged = member.lower() in tagged_lower
+        is_tagged = _match_key(member) in tagged_keys
         label = f"[ON] {member}" if is_tagged else f"[OFF] {member}"
         cb_val = f"tag_toggle:{member}"
         if len(cb_val.encode("utf-8")) > 64:
@@ -1736,34 +1938,49 @@ def _build_summary_view(today_str: str) -> tuple[str, InlineKeyboardMarkup]:
     excluded_keys = {_match_key(u) for u in excluded}
     _admin_ids, admin_keys = get_known_admin_sets()
     hidden_keys = excluded_keys | admin_keys
+    closed_slots = get_closed_slots_for_date(today_str)
 
     visible_rows = [r for r in rows if _match_key(r[0]) not in admin_keys]
-    total_team_penalty = sum(r[6] for r in visible_rows)
-
-    lines = [
-        f"<b>Daily Summary ({today_str} IST)</b>",
-        f"Total Slot Reports: <b>{len(visible_rows)}</b> | Total Team Penalty: <b>₹{total_team_penalty}</b>",
-        "",
-    ]
 
     all_names = [
         name
         for name in _dedup_case_insensitive(members + [r[0] for r in visible_rows])
         if _match_key(name) not in hidden_keys
     ]
-    if not all_names:
+
+    total_late_pen = 0
+    total_missed_pen = 0
+    per_user_lines: list[str] = []
+    for name in all_names:
+        m_key = _match_key(name)
+        u_rows = [r for r in visible_rows if _match_key(r[0]) == m_key]
+        u_late = sum(1 for r in u_rows if r[5] != "On Time")
+        u_late_pen = sum(r[6] for r in u_rows)
+        submitted_slots = {r[3] for r in u_rows}
+        u_missed = sum(1 for s in closed_slots if s.label not in submitted_slots)
+        u_missed_pen = u_missed * PENALTY_MISSED_RS
+        u_total_pen = u_late_pen + u_missed_pen
+        u_join = sum(_safe_int(r[1]) for r in u_rows)
+
+        total_late_pen += u_late_pen
+        total_missed_pen += u_missed_pen
+
+        late_note = f" ({u_late} Late)" if u_late > 0 else ""
+        miss_note = f" | Missed: {u_missed} (₹{u_missed_pen})" if u_missed > 0 else ""
+        pen_note = f" | Total Penalty: <b>₹{u_total_pen}</b>" if u_total_pen > 0 else ""
+        per_user_lines.append(
+            f"- {html.escape(name)}: {len(u_rows)}/5 slots{late_note} | Joining: {u_join}{miss_note}{pen_note}"
+        )
+
+    lines = [
+        f"<b>Daily Summary ({today_str} IST)</b>",
+        f"Total Slot Reports: <b>{len(visible_rows)}</b> | Team Penalty: <b>₹{total_late_pen + total_missed_pen}</b> (Late: ₹{total_late_pen} + Missed: ₹{total_missed_pen})",
+        "",
+    ]
+    if not per_user_lines:
         lines.append("No active assistants shown in summary.")
     else:
-        for name in all_names:
-            u_rows = [r for r in visible_rows if _match_key(r[0]) == _match_key(name)]
-            u_late = sum(1 for r in u_rows if r[5] != "On Time")
-            u_pen = sum(r[6] for r in u_rows)
-            u_join = sum(_safe_int(r[1]) for r in u_rows)
-            late_note = f" ({u_late} Late)" if u_late > 0 else ""
-            pen_note = f" | Penalty: ₹{u_pen}" if u_pen > 0 else ""
-            lines.append(
-                f"- {html.escape(name)}: {len(u_rows)}/5 slots{late_note} | Joining: {u_join}{pen_note}"
-            )
+        lines.extend(per_user_lines)
 
     markup = InlineKeyboardMarkup(
         [
@@ -2492,20 +2709,27 @@ async def mystatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     username = f"@{user.username}" if user.username else (user.first_name or "Unknown User")
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     submitted_map = await asyncio.to_thread(fetch_user_today_slots, username, today_str)
+    closed_labels = {s.label for s in get_closed_slots_for_date(today_str)}
 
-    total_pen = sum(v[3] for v in submitted_map.values())
+    late_pen = sum(v[3] for v in submitted_map.values())
+    missed_count = sum(1 for s in REPORTING_SLOTS if s.label in closed_labels and s.label not in submitted_map)
+    missed_pen = missed_count * PENALTY_MISSED_RS
+    total_pen = late_pen + missed_pen
+
     lines = [
         f"<b>Slot Status for {html.escape(username)} ({today_str})</b>",
-        f"Total Penalty Today: <b>₹{total_pen}</b>",
+        f"Total Penalty Today: <b>₹{total_pen}</b> (Late: ₹{late_pen} + Missed: ₹{missed_pen})",
     ]
     for slot in REPORTING_SLOTS:
         if slot.label in submitted_map:
             sub_t, j_val, st_val, pen_val = submitted_map[slot.label]
             j_note = f" | Join: {html.escape(j_val)}" if j_val else ""
-            pen_note = f" | <b>Penalty: ₹{pen_val}</b>" if pen_val > 0 else " | On Time (₹0)"
+            pen_note = f" | <b>{html.escape(st_val)}</b>" if pen_val > 0 else " | On Time (₹0)"
             lines.append(
                 f"- {html.escape(slot.label)}: Done ({html.escape(sub_t)}{j_note}{pen_note})"
             )
+        elif slot.label in closed_labels:
+            lines.append(f"- {html.escape(slot.label)}: <b>Missed (₹{PENALTY_MISSED_RS} Penalty)</b>")
         else:
             lines.append(f"- {html.escape(slot.label)}: Pending")
 
@@ -2725,6 +2949,14 @@ def _get_slot_countdown_deadline(now_ist: datetime, slot_label: str) -> Optional
     slot = _get_slot_by_label(slot_label)
     if not slot:
         return None
+    if _is_final_slot(slot_label):
+        # Final Report countdown runs from 7:45 PM (final_warning_time) to 8:00:59 PM (slot.end)
+        warn_dt = datetime.combine(now_ist.date(), slot.final_warning_time, tzinfo=IST)
+        end_dt = datetime.combine(now_ist.date(), slot.end, tzinfo=IST)
+        if warn_dt <= now_ist <= end_dt:
+            return end_dt
+        return None
+
     slot_end_dt = datetime.combine(now_ist.date(), slot.end, tzinfo=IST)
     deadline_dt = slot_end_dt + timedelta(seconds=COUNTDOWN_DURATION_SECS)
     if slot_end_dt < now_ist <= deadline_dt:
@@ -2757,23 +2989,44 @@ def _build_countdown_text(
     anim = _COUNTDOWN_ANIM_FRAMES[tick % len(_COUNTDOWN_ANIM_FRAMES)]
     tags_line = " ".join(_format_mention_html(u, uid) for u, uid in pending)
     cutoff_str = deadline_dt.strftime("%I:%M %p IST") if deadline_dt else "00:00"
+    is_final = _is_final_slot(slot_label)
 
     if rem > 0:
+        if is_final:
+            return (
+                f"{anim} <b>FINAL WARNING + 15-MIN COUNTDOWN</b> — {html.escape(slot_label)}\n\n"
+                f"⏱ Time Left Until 8:00 PM: <code>{mins:02d}:{secs:02d}</code>  <code>[{bar}]</code> <b>{pct}%</b>\n"
+                f"🕒 Deadline: <b>{html.escape(cutoff_str)}</b>\n\n"
+                f"🟢 Before 8:00 PM: <b>₹0 (On Time)</b>\n"
+                f"🟡 After 8:00 PM (Late): <b>₹{PENALTY_LATE_FINAL_RS} Penalty</b>\n"
+                f"🔴 Missed Report: <b>₹{PENALTY_MISSED_RS} Penalty</b>\n\n"
+                f"<b>Pending Assistants ({len(pending)}):</b>\n{tags_line}\n\n"
+                f"<i>Submit before 8:00 PM IST to avoid ₹10 / ₹15 penalty!</i>"
+            )
         return (
-            f"{anim} <b>15-MINUTE PENALTY COUNTDOWN</b> — {html.escape(slot_label)}\n\n"
+            f"{anim} <b>15-MINUTE LATE COUNTDOWN</b> — {html.escape(slot_label)}\n\n"
             f"⏱ Time Remaining: <code>{mins:02d}:{secs:02d}</code>  <code>[{bar}]</code> <b>{pct}%</b>\n"
-            f"🕒 Deadline: <b>{html.escape(cutoff_str)}</b>\n\n"
-            f"🟡 Submit <b>BEFORE {html.escape(cutoff_str)} (00:00)</b>: <b>₹{PENALTY_COUNTDOWN_RS} Penalty ONLY</b>\n"
-            f"🔴 Submit <b>AFTER {html.escape(cutoff_str)}</b>: <b>₹{PENALTY_AFTER_COUNTDOWN_RS} Penalty</b>\n\n"
+            f"🕒 Grace Cutoff: <b>{html.escape(cutoff_str)}</b>\n\n"
+            f"🟡 Late Submit (Timing ke baad bhi bhejein): <b>₹{PENALTY_LATE_REGULAR_RS} Penalty ONLY</b>\n"
+            f"🔴 Missed Slot (Nahi bheja toh): <b>₹{PENALTY_MISSED_RS} Penalty</b>\n\n"
             f"<b>Pending Assistants ({len(pending)}):</b>\n{tags_line}\n\n"
-            f"<i>Submit your report (Caption: Username + Joining) right now!</i>"
+            f"<i>Abhi submit karein (₹5 Late) warna ₹15 Missed penalty lagegi!</i>"
         )
 
+    if is_final:
+        return (
+            f"🚨💥 <b>8:00 PM LAST WARNING — ₹{PENALTY_LATE_FINAL_RS} PENALTY ACTIVE!</b>\n"
+            f"Slot: <b>{html.escape(slot_label)}</b> ({today_str})\n\n"
+            f"<code>[░░░░░░░░░░░░]</code> <b>0%</b>\n"
+            f"🟡 Submit Late Now: <b>₹{PENALTY_LATE_FINAL_RS} Penalty</b>\n"
+            f"🔴 If Missed Completely: <b>₹{PENALTY_MISSED_RS} Penalty</b>\n\n"
+            f"<b>Still Pending ({len(pending)}):</b>\n{tags_line}"
+        )
     return (
-        f"🚨💥 <b>TIME UP (00:00) — ₹{PENALTY_AFTER_COUNTDOWN_RS} PENALTY ACTIVE!</b>\n"
+        f"🚨💥 <b>COUNTDOWN ENDED (00:00) — ₹{PENALTY_MISSED_RS} MISSED PENALTY!</b>\n"
         f"Slot: <b>{html.escape(slot_label)}</b> ({today_str})\n\n"
         f"<code>[░░░░░░░░░░░░]</code> <b>0%</b>\n"
-        f"🔴 Deadline ({html.escape(cutoff_str)}) ended. Any submission now will carry a <b>₹{PENALTY_AFTER_COUNTDOWN_RS} Penalty</b>.\n\n"
+        f"🔴 Unsubmitted reports are now <b>Missed (₹{PENALTY_MISSED_RS} Penalty)</b>. Late submit still saves you to <b>₹{PENALTY_LATE_REGULAR_RS}</b>.\n\n"
         f"<b>Still Pending ({len(pending)}):</b>\n{tags_line}"
     )
 
@@ -2799,7 +3052,7 @@ async def _run_countdown_animation(
 
             if not pending:
                 text = _build_countdown_text(
-                    slot_label, today_str, 0, [], tick, ended_early=True
+                    slot_label, today_str, 0, [], tick, ended_early=True, deadline_dt=end_dt
                 )
                 try:
                     await bot.edit_message_text(
@@ -2969,19 +3222,19 @@ async def send_slot_open_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     tags_line = " ".join(_format_mention_html(u, uid) for u, uid in tagged_pairs)
     attention_block = f"Attention: {tags_line}\n" if tags_line else ""
 
-    if "Final" in slot_label:
+    if _is_final_slot(slot_label):
         msg = (
-            f"<b>WARNING &amp; REMINDER:</b> {html.escape(slot_label)} is now OPEN!\n"
+            f"<b>WARNING &amp; REMINDER:</b> {html.escape(slot_label)} is now OPEN (7:15 PM IST)!\n"
             f"{attention_block}"
-            f"Submit your report (Username + Joining) before 8:15 PM IST for <b>On Time (₹0)</b>.\n"
-            f"After 8:15 PM IST, a 15-min countdown starts (<b>₹5 Penalty</b>, then <b>₹15 Penalty</b>)."
+            f"Submit your report (Username + Joining) before <b>8:00 PM IST</b> for <b>On Time (₹0)</b>.\n"
+            f"7:45 PM: Final Warning + 15-Min Countdown | After 8:00 PM: <b>₹{PENALTY_LATE_FINAL_RS} Late</b> | Missed: <b>₹{PENALTY_MISSED_RS}</b>."
         )
     else:
         msg = (
             f"<b>WARNING &amp; REMINDER:</b> {html.escape(slot_label)} is now OPEN!\n"
             f"{attention_block}"
             f"Submit within 15 minutes for <b>On Time (₹0)</b>.\n"
-            f"After 15 mins, a 15-min countdown starts: before 00:00 = <b>₹5 Penalty</b>, after = <b>₹15 Penalty</b>."
+            f"After 15 mins (Late submit): <b>₹{PENALTY_LATE_REGULAR_RS} Penalty</b> | If Missed: <b>₹{PENALTY_MISSED_RS} Penalty</b>."
         )
 
     try:
@@ -2998,8 +3251,13 @@ async def send_slot_final_warning_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     if work_group_id is None:
         return
 
-    await refresh_group_admins(context.bot, work_group_id)
     slot_label = str(context.job.data)
+    if _is_final_slot(slot_label):
+        # At 7:45 PM, send Final Warning WITH live 15-min countdown to 8:00 PM
+        await launch_penalty_countdown(context.bot, work_group_id, slot_label)
+        return
+
+    await refresh_group_admins(context.bot, work_group_id)
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     pending = await asyncio.to_thread(
         get_pending_tagged_assistants_for_slot, today_str, slot_label
@@ -3012,12 +3270,39 @@ async def send_slot_final_warning_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = (
         f"<b>5 MINUTES LEFT (ON-TIME WINDOW)</b> — {html.escape(slot_label)}\n"
         f"Pending Assistants: {tags_line}\n"
-        f"Submit in 5 mins for ₹0! After that, a 15-min ₹5 penalty countdown begins (then ₹15)."
+        f"Submit in 5 mins for ₹0! After 15 mins: Late = <b>₹{PENALTY_LATE_REGULAR_RS}</b> | Missed = <b>₹{PENALTY_MISSED_RS}</b>."
     )
     try:
         await context.bot.send_message(chat_id=work_group_id, text=msg, parse_mode="HTML")
     except Exception as exc:
         logger.warning("Could not send 5-min final warning to %s: %s", work_group_id, exc)
+
+
+async def send_final_8pm_last_warning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fires at 8:00 PM IST to notify any remaining pending assistants that ₹10 Final Late Penalty is now active."""
+    if not is_reminders_enabled():
+        return
+    work_group_id = get_work_group_id()
+    if work_group_id is None:
+        return
+    await refresh_group_admins(context.bot, work_group_id)
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    pending = await asyncio.to_thread(
+        get_pending_tagged_assistants_for_slot, today_str, FINAL_SLOT_LABEL
+    )
+    if not pending:
+        return
+    tags_line = " ".join(_format_mention_html(u, uid) for u, uid in pending)
+    msg = (
+        f"🚨 <b>8:00 PM LAST WARNING — FINAL REPORT</b>\n"
+        f"Pending Assistants: {tags_line}\n"
+        f"On-Time window closed! Submit late now for <b>₹{PENALTY_LATE_FINAL_RS} Penalty</b> — "
+        f"if missed, <b>₹{PENALTY_MISSED_RS} Penalty</b> applies."
+    )
+    try:
+        await context.bot.send_message(chat_id=work_group_id, text=msg, parse_mode="HTML")
+    except Exception as exc:
+        logger.warning("Could not send 8:00 PM last warning to %s: %s", work_group_id, exc)
 
 
 async def start_penalty_countdown_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3362,7 +3647,7 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
     was_updated = await refresh_active_countdown(context.bot, chat.id, active_slot)
     if (
         not was_updated
-        and penalty_rs == PENALTY_COUNTDOWN_RS
+        and _get_slot_countdown_deadline(ist_dt, active_slot) is not None
         and is_reminders_enabled()
     ):
         await launch_penalty_countdown(context.bot, chat.id, active_slot)
@@ -3479,22 +3764,33 @@ async def post_init(application: Application) -> None:
             name=f"reminder_warn_{slot.label}",
         )
 
-        countdown_start_dt = datetime.combine(today_ist, slot.end, tzinfo=IST) + timedelta(seconds=1)
-        application.job_queue.run_daily(
-            start_penalty_countdown_job,
-            time=countdown_start_dt.timetz(),
-            data=slot.label,
-            name=f"penalty_countdown_{slot.label}",
-        )
+        if _is_final_slot(slot.label):
+            last_warn_dt = datetime.combine(today_ist, time(20, 0, 0), tzinfo=IST)
+            application.job_queue.run_daily(
+                send_final_8pm_last_warning_job,
+                time=last_warn_dt.timetz(),
+                data=slot.label,
+                name="final_8pm_last_warning",
+            )
+        else:
+            countdown_start_dt = datetime.combine(today_ist, slot.end, tzinfo=IST) + timedelta(seconds=1)
+            application.job_queue.run_daily(
+                start_penalty_countdown_job,
+                time=countdown_start_dt.timetz(),
+                data=slot.label,
+                name=f"penalty_countdown_{slot.label}",
+            )
 
-    # If bot starts/restarts mid-window (e.g. 10:16–10:30 IST), resume active countdown immediately
+    # If bot starts/restarts mid-window (e.g. 10:16–10:30 or 7:45–8:00 PM IST), resume active countdown immediately
     if work_gid is not None and is_reminders_enabled():
         now_ist = datetime.now(IST)
         for slot in REPORTING_SLOTS:
             if _get_slot_countdown_deadline(now_ist, slot.label) is not None:
                 await launch_penalty_countdown(application.bot, work_gid, slot.label)
 
-    logger.info("Scheduled daily Excel (20:35 IST), slot warnings, and 15-min ₹5/₹15 penalty countdowns.")
+    logger.info(
+        "Scheduled daily Excel (20:35 IST), Final 7:15/7:45 countdown + 8:00 PM warning, and ₹5/₹10/₹15 penalties."
+    )
 
 
 def main() -> None:

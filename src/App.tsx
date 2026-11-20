@@ -42,9 +42,10 @@ const TIME_PRESETS = [
   { label: '1:05 PM (Slot)', value: '13:05:12' },
   { label: '3:15 PM (Grace)', value: '15:15:30' },
   { label: '5:10 PM (Slot)', value: '17:10:00' },
-  { label: '7:41 PM (Final)', value: '19:41:10' },
-  { label: '8:14 PM (Grace)', value: '20:14:30' },
-  { label: '8:18 PM (Closed)', value: '20:18:10' },
+  { label: '7:15 PM (Final Open)', value: '19:15:10' },
+  { label: '7:45 PM (Countdown)', value: '19:45:00' },
+  { label: '8:00 PM (Last Warn)', value: '20:00:30' },
+  { label: '8:05 PM (Late ₹10)', value: '20:05:00' },
 ];
 
 const CHECKLIST_STORAGE_KEY = 'slottrack_excel_only_checklist_v4';
@@ -169,17 +170,20 @@ export default function App() {
     const attentionLine = allTags ? `Attention: ${allTags}\n` : '';
     if (reminderPreviewMode === 'open') {
       if (selectedSlotObj.id === 'final') {
-        return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\n${attentionLine}Please upload your photo report before 8:00 PM IST (grace period ends 8:15 PM IST). Reports are ONLY recorded during active slot hours.`;
+        return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN (7:15 PM - 8:00 PM)!\n${attentionLine}Send your photo report before 8:00 PM IST to stay On Time (₹0). Final Warning + Countdown starts at 7:45 PM IST; after 8:00 PM = Late (₹10), Missed = ₹15.`;
       }
-      return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\n${attentionLine}Upload your photo report within 15 minutes. Reports outside slot hours will NOT be recorded.`;
+      return `WARNING & REMINDER: ${selectedSlotObj.label} is now OPEN!\n${attentionLine}Upload your photo report within 15 minutes (On Time = ₹0). After 15 min = Late (₹5), Missed = ₹15.`;
     }
     if (assistantTags.length === 0) {
       return 'No assistants are currently tagged. Use /tags or /settags @user1 @user2 to select who should receive warnings.';
     }
     if (pendingAssistantsForSelectedSlot.length === 0) {
-      return `All tagged assistants have already submitted ${selectedSlotObj.label}. No 5-minute final warning needed.`;
+      return `All tagged assistants have already submitted ${selectedSlotObj.label}. No final warning needed.`;
     }
-    return `FINAL WARNING (5 MINUTES LEFT) — ${selectedSlotObj.label}\nPending Assistants: ${pendingAssistantsForSelectedSlot.join(' ')}\nUpload your photo report immediately! Slot closes in 5 minutes and will NOT record late uploads.`;
+    if (selectedSlotObj.id === 'final') {
+      return `FINAL WARNING (7:45 PM LIVE COUNTDOWN) — ${selectedSlotObj.label}\nPending Assistants: ${pendingAssistantsForSelectedSlot.join(' ')}\nTime Left Before 8:00 PM Cutoff: 14:59 | Submit now for ₹0 (After 8:00 PM = ₹10, Missed = ₹15).`;
+    }
+    return `FINAL WARNING (15-MIN COUNTDOWN) — ${selectedSlotObj.label}\nPending Assistants: ${pendingAssistantsForSelectedSlot.join(' ')}\nUpload your photo report! Late = ₹5, Missed = ₹15.`;
   }, [
     remindersEnabled,
     reminderPreviewMode,
@@ -686,7 +690,7 @@ export default function App() {
                           } | Date: ${simDate}\nStatus: On Time${
                             simCaption.trim() ? `\nNote: ${simCaption.trim()}` : ''
                           }`
-                        : `Not recorded (${liveEvaluation.formattedTimeIst}): Reports are ONLY recorded during slot windows.\nActive IST Slots: 10:00-10:15 AM, 1:00-1:15 PM, 3:00-3:15 PM, 5:00-5:15 PM, and 7:30-8:15 PM.`}
+                        : `Not recorded (${liveEvaluation.formattedTimeIst}): Outside On-Time slot window.\nOn-Time IST Slots: 10:00-10:15 AM, 1:00-1:15 PM, 3:00-3:15 PM, 5:00-5:15 PM, and 7:15-8:00 PM (Final).\nNote: Bot records late reports as Late (₹5 regular / ₹10 after 8 PM; Missed = ₹15).`}
                   </pre>
                 </div>
               </div>
