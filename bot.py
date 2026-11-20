@@ -1,18 +1,19 @@
 """
-Telegram Group Photo Report Tracker -> Excel-Only (.xlsx) + Auto Assistant Discovery
+Telegram Group Report Tracker -> Excel-Only (.xlsx) + Auto Assistant Discovery + Penalty Countdown
 Deployable directly via GitHub + Render Free Tier (no Google Sheets / external DB needed).
 
 Core Behavior:
   1. Excel-Only Delivery: Sends formatted .xlsx workbook (team_report_YYYY-MM-DD.xlsx)
-     to your Excel/Backup Group on every recorded slot submission AND at 8:30 PM IST to Admin DM.
+     to your Excel/Backup Group on every recorded slot submission AND at 8:35 PM IST to Admin DM.
   2. Auto-Recognize Assistants: When any non-admin member sends ANY message in the work group
      (or joins), the bot automatically registers them as an assistant and enables tagging
-     (unless manually turned OFF via /tags or /removetag).
-     Note: Make the bot Admin in your Work Group (or remove & re-add after disabling Group
-     Privacy in @BotFather) so Telegram delivers all plain-text messages like "Hi" to the bot.
-  3. Strict Slot-Time Recording: Photo reports are ONLY recorded during the 5 active IST slot
-     windows (+15 min grace). Uploads outside slot hours are NOT logged to Excel.
-  4. Safe HTML formatting + user_id mention fallback for members without @username.
+     (unless manually turned OFF via /tags or /removetag). Group Admins are automatically excluded.
+  3. Slot Timing + 15-Min Animated Penalty Countdown:
+     - First 15 mins (On-Time window): Recorded as On Time (₹0).
+     - After 15 mins: Tags pending non-admin assistants and runs a 15-minute animated countdown.
+       Submitting before countdown ends (00:00) incurs ₹5 Penalty ONLY.
+       Submitting after countdown ends (00:00) incurs ₹15 Penalty.
+  4. Safe HTML formatting + user_id mention fallback + full edited-caption & album support.
 
 Requires: python-telegram-bot[job-queue] >= 21.0, openpyxl >= 3.1.5, python-dotenv, tzdata
 """
@@ -97,12 +98,18 @@ PREVENT_DUPLICATE_SLOTS = os.getenv("PREVENT_DUPLICATE_SLOTS", "true").strip().l
 
 DB_PATH = os.getenv("DB_PATH", "reports.db").strip()
 IST = ZoneInfo("Asia/Kolkata")
-DAILY_SEND_TIME_IST = time(hour=20, minute=30, second=0, tzinfo=IST)  # 8:30 PM IST
+DAILY_SEND_TIME_IST = time(hour=20, minute=35, second=0, tzinfo=IST)  # 8:35 PM IST (after Final ₹5 countdown)
+COUNTDOWN_DURATION_SECS = 15 * 60
+COUNTDOWN_REFRESH_SECS = 15
+PENALTY_COUNTDOWN_RS = 5
+PENALTY_AFTER_COUNTDOWN_RS = 15
 
 _REPORT_LOCK = asyncio.Lock()
 _SEEN_MEDIA_GROUPS: dict[str, datetime] = {}
 _MISMATCH_WARN_CACHE: dict[int, datetime] = {}
 _ADMIN_SYNC_CACHE: dict[int, datetime] = {}
+_ACTIVE_COUNTDOWNS: dict[tuple[int, str], dict[str, object]] = {}
+_COUNTDOWN_TASKS: dict[tuple[int, str], asyncio.Task] = {}
 _CELEBRATION_EMOJIS: tuple[str, ...] = ("🔥", "🎉", "💯", "🏆", "⚡", "🤩", "👏")
 
 
@@ -194,59 +201,120 @@ def _parse_ist_time_str(sub_time: str) -> Optional[time]:
     return None
 
 
-def evaluate_slot_status(ist_dt: datetime, slot_label: str) -> str:
-    """Strictly check if an IST timestamp falls within the slot's cutoff window."""
+def _time_to_secs(t: time) -> int:
+    return t.hour * 3600 + t.minute * 60 + t.second
+
+
+def evaluate_slot_status_and_penalty(ist_dt: datetime, slot_label: str) -> tuple[str, int]:
+    """
+    Evaluate Status and Penalty (₹0, ₹5, ₹15) for a submission against a given slot:
+      - Within [slot.start, slot.end] (or <= 15m early): On Time, ₹0
+      - Within 15-min countdown (slot.end + 1s .. slot.end + 15m): Late (₹5 Penalty), ₹5
+      - After 15-min countdown ends (> slot.end + 15m): Late (₹15 Penalty), ₹15
+    """
     slot = _get_slot_by_label(slot_label)
     if not slot:
-        return "On Time"
-    current_t = ist_dt.time().replace(tzinfo=None)
-    if slot.start <= current_t <= slot.end:
-        return "On Time"
-    if current_t > slot.end:
-        return "Late"
-    start_sec = slot.start.hour * 3600 + slot.start.minute * 60 + slot.start.second
-    cur_sec = current_t.hour * 3600 + current_t.minute * 60 + current_t.second
+        return "On Time", 0
+    cur_sec = _time_to_secs(ist_dt.time().replace(tzinfo=None))
+    start_sec = _time_to_secs(slot.start)
+    end_sec = _time_to_secs(slot.end)
+    countdown_end_sec = end_sec + COUNTDOWN_DURATION_SECS
+
+    if start_sec <= cur_sec <= end_sec:
+        return "On Time", 0
     if 0 <= (start_sec - cur_sec) <= 900:
-        return "On Time"
-    return "Late"
+        return "On Time", 0
+    if end_sec < cur_sec <= countdown_end_sec:
+        return f"Late (₹{PENALTY_COUNTDOWN_RS} Penalty)", PENALTY_COUNTDOWN_RS
+    return f"Late (₹{PENALTY_AFTER_COUNTDOWN_RS} Penalty)", PENALTY_AFTER_COUNTDOWN_RS
 
 
-def evaluate_slot_status_from_strings(submission_time: str, slot_label: str) -> str:
+def evaluate_slot_status(ist_dt: datetime, slot_label: str) -> str:
+    return evaluate_slot_status_and_penalty(ist_dt, slot_label)[0]
+
+
+def evaluate_slot_status_from_strings_with_penalty(
+    submission_time: str, slot_label: str
+) -> tuple[str, int]:
     parsed_t = _parse_ist_time_str(submission_time)
     slot = _get_slot_by_label(slot_label)
     if not parsed_t or not slot:
-        return "On Time"
-    if slot.start <= parsed_t <= slot.end:
-        return "On Time"
-    if parsed_t > slot.end:
-        return "Late"
-    start_sec = slot.start.hour * 3600 + slot.start.minute * 60 + slot.start.second
-    cur_sec = parsed_t.hour * 3600 + parsed_t.minute * 60 + parsed_t.second
+        return "On Time", 0
+    cur_sec = _time_to_secs(parsed_t)
+    start_sec = _time_to_secs(slot.start)
+    end_sec = _time_to_secs(slot.end)
+    countdown_end_sec = end_sec + COUNTDOWN_DURATION_SECS
+
+    if start_sec <= cur_sec <= end_sec:
+        return "On Time", 0
     if 0 <= (start_sec - cur_sec) <= 900:
-        return "On Time"
-    return "Late"
+        return "On Time", 0
+    if end_sec < cur_sec <= countdown_end_sec:
+        return f"Late (₹{PENALTY_COUNTDOWN_RS} Penalty)", PENALTY_COUNTDOWN_RS
+    return f"Late (₹{PENALTY_AFTER_COUNTDOWN_RS} Penalty)", PENALTY_AFTER_COUNTDOWN_RS
+
+
+def evaluate_slot_status_from_strings(submission_time: str, slot_label: str) -> str:
+    return evaluate_slot_status_from_strings_with_penalty(submission_time, slot_label)[0]
+
+
+def resolve_submission_slot_and_penalty(ist_dt: datetime) -> tuple[Optional[str], str, int]:
+    """
+    Map ANY report submission time (>= 10:00 AM IST) to the active or most-recent slot
+    with exact ₹0 / ₹5 / ₹15 penalty status so valid reports after 15 mins are NEVER dropped.
+    """
+    cur_sec = _time_to_secs(ist_dt.time().replace(tzinfo=None))
+
+    for slot in REPORTING_SLOTS:
+        if _time_to_secs(slot.start) <= cur_sec <= _time_to_secs(slot.end):
+            return slot.label, "On Time", 0
+
+    latest_started: Optional[ReportingSlot] = None
+    for slot in REPORTING_SLOTS:
+        if cur_sec >= _time_to_secs(slot.start):
+            latest_started = slot
+
+    if latest_started is None:
+        return None, "Outside Slot", 0
+
+    status, penalty_rs = evaluate_slot_status_and_penalty(ist_dt, latest_started.label)
+    return latest_started.label, status, penalty_rs
 
 
 def recalculate_report_statuses(conn: sqlite3.Connection) -> int:
-    """Auto-fix any previously saved 'On Time' rows whose submission_time is past the slot's 15-min cutoff."""
+    """Auto-sync status and ₹5/₹15 penalty on existing/restored rows based on submission_time."""
     fixed = 0
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(reports)").fetchall()}
+    has_pen = "penalty_rs" in cols
+    sel_pen = "COALESCE(penalty_rs, 0)" if has_pen else "0"
     rows = conn.execute(
-        "SELECT id, submission_time, reporting_slot, status FROM reports WHERE status = 'On Time'"
+        f"SELECT id, submission_time, reporting_slot, status, {sel_pen} FROM reports"
     ).fetchall()
-    for row_id, sub_time, slot_label, status in rows:
-        expected = evaluate_slot_status_from_strings(str(sub_time or ""), str(slot_label or ""))
-        if expected != status:
-            conn.execute("UPDATE reports SET status = ? WHERE id = ?", (expected, row_id))
+    for row_id, sub_time, slot_label, status, cur_pen in rows:
+        expected_status, expected_pen = evaluate_slot_status_from_strings_with_penalty(
+            str(sub_time or ""), str(slot_label or "")
+        )
+        if expected_status != status or int(cur_pen or 0) != expected_pen:
+            if has_pen:
+                conn.execute(
+                    "UPDATE reports SET status = ?, penalty_rs = ? WHERE id = ?",
+                    (expected_status, expected_pen, row_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE reports SET status = ? WHERE id = ?",
+                    (expected_status, row_id),
+                )
             fixed += 1
     return fixed
 
 
 _USERNAME_PATTERN = re.compile(
-    r"(?:username|user\s*name|user|tg\s*id|id)\s*[:=\-–—]+\s*(@?[A-Za-z0-9_]{3,})",
+    r"(?:telegram[ \t]*)?(?:username|user[ \t]*name|user|tg[ \t]*id|tg[ \t]*username|id)[ \t]*(?:[:=\-–—]+[ \t]*@?([A-Za-z0-9_]{3,})|[ \t]+@([A-Za-z0-9_]{3,}))",
     re.IGNORECASE,
 )
 _JOINING_PATTERN = re.compile(
-    r"(?:total\s*)?(?:joining|joins|join)\s*[:=\-–—]*\s*(\d+)",
+    r"(?:(?:total[ \t]*)?(?:joinings?|jonings?|joins?)[ \t]*[:=\-–—]*[ \t]*(\d[\d,]*))|(?:(?<![A-Za-z0-9_@])(\d[\d,]*)[ \t]+(?:total[ \t]+)?(?:joinings?|jonings?|joins?)\b)",
     re.IGNORECASE,
 )
 
@@ -256,14 +324,16 @@ def parse_report_fields(raw_text: str, fallback_username: str) -> tuple[str, str
     username = fallback_username
     user_match = _USERNAME_PATTERN.search(text)
     if user_match:
-        extracted = user_match.group(1).strip()
+        extracted = (user_match.group(1) or user_match.group(2) or "").strip()
         if extracted:
             username = extracted if extracted.startswith("@") else f"@{extracted}"
 
     joining = ""
     join_match = _JOINING_PATTERN.search(text)
     if join_match:
-        joining = join_match.group(1).strip()
+        raw_num = (join_match.group(1) or join_match.group(2) or "").replace(",", "").strip()
+        if raw_num:
+            joining = raw_num
 
     return username, joining
 
@@ -312,6 +382,7 @@ def init_db() -> None:
                 reporting_slot TEXT NOT NULL,
                 report_date TEXT NOT NULL,
                 status TEXT NOT NULL,
+                penalty_rs INTEGER NOT NULL DEFAULT 0,
                 caption TEXT DEFAULT '',
                 created_at_utc TEXT NOT NULL
             )
@@ -385,6 +456,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE reports ADD COLUMN user_id INTEGER")
         if "joining" not in report_cols:
             conn.execute("ALTER TABLE reports ADD COLUMN joining TEXT DEFAULT ''")
+        if "penalty_rs" not in report_cols:
+            conn.execute("ALTER TABLE reports ADD COLUMN penalty_rs INTEGER NOT NULL DEFAULT 0")
         if "caption" not in report_cols:
             conn.execute("ALTER TABLE reports ADD COLUMN caption TEXT DEFAULT ''")
 
@@ -800,14 +873,15 @@ def toggle_assistant_tag(username: str) -> bool:
 def has_slot_submission(
     username: str, report_date: str, reporting_slot: str
 ) -> Optional[tuple[int, str, str]]:
+    key = _match_key(username)
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             """
             SELECT id, submission_time, COALESCE(joining, '') FROM reports
-            WHERE LOWER(username) = LOWER(?) AND report_date = ? AND reporting_slot = ?
+            WHERE LOWER(LTRIM(username, '@')) = ? AND report_date = ? AND reporting_slot = ?
             LIMIT 1
             """,
-            (username, report_date, reporting_slot),
+            (key, report_date, reporting_slot),
         ).fetchone()
         return (int(row[0]), str(row[1]), str(row[2])) if row else None
 
@@ -821,13 +895,18 @@ def get_pending_tagged_assistants_for_slot(
     with sqlite3.connect(DB_PATH) as conn:
         submitted_rows = conn.execute(
             """
-            SELECT DISTINCT LOWER(username) FROM reports
+            SELECT DISTINCT LOWER(LTRIM(username, '@')), user_id FROM reports
             WHERE report_date = ? AND reporting_slot = ?
             """,
             (report_date, slot_label),
         ).fetchall()
-    submitted_set = {r[0] for r in submitted_rows}
-    return [(u, uid) for u, uid in tagged if u.lower() not in submitted_set]
+    submitted_keys = {str(r[0]) for r in submitted_rows if r[0]}
+    submitted_ids = {int(r[1]) for r in submitted_rows if r[1] is not None}
+    return [
+        (u, uid)
+        for u, uid in tagged
+        if _match_key(u) not in submitted_keys and (uid is None or uid not in submitted_ids)
+    ]
 
 
 def upsert_report_to_db(
@@ -841,15 +920,17 @@ def upsert_report_to_db(
     caption: str,
     created_at_utc: str,
     overwrite_existing: bool = True,
+    penalty_rs: int = 0,
 ) -> str:
+    key = _match_key(username)
     with sqlite3.connect(DB_PATH) as conn:
         existing = conn.execute(
             """
             SELECT id, COALESCE(joining, ''), COALESCE(caption, '') FROM reports
-            WHERE LOWER(username) = LOWER(?) AND report_date = ? AND reporting_slot = ?
+            WHERE LOWER(LTRIM(username, '@')) = ? AND report_date = ? AND reporting_slot = ?
             LIMIT 1
             """,
-            (username, report_date, reporting_slot),
+            (key, report_date, reporting_slot),
         ).fetchone()
 
         if existing:
@@ -864,10 +945,11 @@ def upsert_report_to_db(
                         joining = ?,
                         submission_time = ?,
                         status = ?,
+                        penalty_rs = ?,
                         caption = ?
                     WHERE id = ?
                     """,
-                    (user_id, new_joining, submission_time, status, new_caption, row_id),
+                    (user_id, new_joining, submission_time, status, penalty_rs, new_caption, row_id),
                 )
                 conn.commit()
                 action = "updated"
@@ -877,8 +959,8 @@ def upsert_report_to_db(
             conn.execute(
                 """
                 INSERT INTO reports (
-                    user_id, username, joining, submission_time, reporting_slot, report_date, status, caption, created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_id, username, joining, submission_time, reporting_slot, report_date, status, penalty_rs, caption, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -888,6 +970,7 @@ def upsert_report_to_db(
                     reporting_slot,
                     report_date,
                     status,
+                    penalty_rs,
                     caption,
                     created_at_utc,
                 ),
@@ -903,12 +986,12 @@ def upsert_report_to_db(
 def fetch_reports(
     date_filter: Optional[str] = None,
     start_date: Optional[str] = None,
-) -> list[tuple[str, str, str, str, str, str, str]]:
+) -> list[tuple[str, str, str, str, str, str, int, str]]:
     with sqlite3.connect(DB_PATH) as conn:
         if date_filter:
             cursor = conn.execute(
                 """
-                SELECT username, COALESCE(joining, ''), submission_time, reporting_slot, report_date, status, COALESCE(caption, '')
+                SELECT username, COALESCE(joining, ''), submission_time, reporting_slot, report_date, status, COALESCE(penalty_rs, 0), COALESCE(caption, '')
                 FROM reports
                 WHERE report_date = ?
                 ORDER BY id ASC
@@ -918,7 +1001,7 @@ def fetch_reports(
         elif start_date:
             cursor = conn.execute(
                 """
-                SELECT username, COALESCE(joining, ''), submission_time, reporting_slot, report_date, status, COALESCE(caption, '')
+                SELECT username, COALESCE(joining, ''), submission_time, reporting_slot, report_date, status, COALESCE(penalty_rs, 0), COALESCE(caption, '')
                 FROM reports
                 WHERE report_date >= ?
                 ORDER BY report_date ASC, id ASC
@@ -928,25 +1011,32 @@ def fetch_reports(
         else:
             cursor = conn.execute(
                 """
-                SELECT username, COALESCE(joining, ''), submission_time, reporting_slot, report_date, status, COALESCE(caption, '')
+                SELECT username, COALESCE(joining, ''), submission_time, reporting_slot, report_date, status, COALESCE(penalty_rs, 0), COALESCE(caption, '')
                 FROM reports
                 ORDER BY id ASC
                 """
             )
-        return cursor.fetchall()
+        return [
+            (r[0], r[1], r[2], r[3], r[4], r[5], int(r[6] or 0), r[7])
+            for r in cursor.fetchall()
+        ]
 
 
-def fetch_user_today_slots(username: str, report_date: str) -> dict[str, tuple[str, str]]:
+def fetch_user_today_slots(username: str, report_date: str) -> dict[str, tuple[str, str, str, int]]:
+    key = _match_key(username)
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             """
-            SELECT reporting_slot, submission_time, COALESCE(joining, '')
+            SELECT reporting_slot, submission_time, COALESCE(joining, ''), status, COALESCE(penalty_rs, 0)
             FROM reports
-            WHERE LOWER(username) = LOWER(?) AND report_date = ?
+            WHERE LOWER(LTRIM(username, '@')) = ? AND report_date = ?
             """,
-            (username, report_date),
+            (key, report_date),
         ).fetchall()
-    return {slot: (sub_time, joining) for slot, sub_time, joining in rows}
+    return {
+        slot: (sub_time, joining, status, int(pen or 0))
+        for slot, sub_time, joining, status, pen in rows
+    }
 
 
 def count_total_reports() -> int:
@@ -956,7 +1046,7 @@ def count_total_reports() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Styled Excel (.xlsx) Workbook Builder (4 Sheets) & Restore Parser
+# Styled Excel (.xlsx) Workbook Builder (5 Sheets) & Restore Parser
 # ---------------------------------------------------------------------------
 def _style_sheet(
     ws, headers: list[str], rows: list[tuple[str, ...]], status_col_idx: Optional[int] = None
@@ -965,6 +1055,8 @@ def _style_sheet(
     header_font = Font(color="FFFFFF", bold=True, size=11)
     on_time_fill = PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid")
     on_time_font = Font(color="166534", bold=True)
+    warn5_fill = PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
+    warn5_font = Font(color="92400E", bold=True)
     late_fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
     late_font = Font(color="991B1B", bold=True)
 
@@ -985,7 +1077,10 @@ def _style_sheet(
             if status_val == "On Time":
                 status_cell.fill = on_time_fill
                 status_cell.font = on_time_font
-            elif any(w in status_val.lower() for w in ("late", "missed", "outside")):
+            elif "₹5" in status_val:
+                status_cell.fill = warn5_fill
+                status_cell.font = warn5_font
+            elif any(w in status_val.lower() for w in ("late", "missed", "outside", "₹15")):
                 status_cell.fill = late_fill
                 status_cell.font = late_font
 
@@ -1052,26 +1147,38 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
         "Reporting Slot",
         "Date",
         "Status",
+        "Penalty (₹)",
         "Caption",
     ]
-    _style_sheet(ws_log, log_headers, period_rows, status_col_idx=6)
+    period_excel_rows = [
+        (r[0], r[1], r[2], r[3], r[4], r[5], f"₹{r[6]}", r[7]) for r in period_rows
+    ]
+    all_excel_rows = [
+        (r[0], r[1], r[2], r[3], r[4], r[5], f"₹{r[6]}", r[7]) for r in all_rows
+    ]
+    _style_sheet(ws_log, log_headers, period_excel_rows, status_col_idx=6)
 
     ws_summary = wb.create_sheet(title="Member Summary")
     summary_rows: list[tuple[str, ...]] = []
     for member in members:
         member_rows = [r for r in period_rows if _match_key(r[0]) == _match_key(member)]
         on_time = sum(1 for r in member_rows if r[5] == "On Time")
-        late_count = sum(1 for r in member_rows if r[5] != "On Time")
+        late_5 = sum(1 for r in member_rows if r[6] == PENALTY_COUNTDOWN_RS)
+        late_15 = sum(1 for r in member_rows if r[6] >= PENALTY_AFTER_COUNTDOWN_RS)
+        other_late = sum(1 for r in member_rows if r[5] != "On Time" and r[6] == 0)
+        total_pen = sum(r[6] for r in member_rows)
         total_joining = sum(_safe_int(r[1]) for r in member_rows)
         expected_slots = len(slot_labels) * days
-        missed = max(expected_slots - on_time - late_count, 0)
+        missed = max(expected_slots - on_time - late_5 - late_15 - other_late, 0)
         compliance = round((on_time / expected_slots) * 100) if expected_slots else 0
         summary_rows.append(
             (
                 member,
                 str(total_joining),
                 str(on_time),
-                str(late_count),
+                str(late_5),
+                str(late_15 + other_late),
+                f"₹{total_pen}",
                 str(missed),
                 f"{compliance}%",
                 today_str,
@@ -1080,7 +1187,17 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
 
     _style_sheet(
         ws_summary,
-        ["Username", "Total Joining", "Submitted On Time", "Late", "Missed Slots", "Compliance %", "Reference Date"],
+        [
+            "Username",
+            "Total Joining",
+            "Submitted On Time",
+            "Late (₹5)",
+            "Late (₹15)",
+            "Total Penalty",
+            "Missed Slots",
+            "Compliance %",
+            "Reference Date",
+        ],
         summary_rows,
     )
 
@@ -1089,21 +1206,24 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
     matrix_rows: list[tuple[str, ...]] = []
     for member in members:
         member_day_slots = {
-            r[3]: (r[1], r[2], r[5]) for r in target_day_rows if _match_key(r[0]) == _match_key(member)
+            r[3]: (r[1], r[2], r[5], r[6])
+            for r in target_day_rows
+            if _match_key(r[0]) == _match_key(member)
         }
         row_cells = [member]
         day_joining = 0
         for label in slot_labels:
             if label in member_day_slots:
-                j_val, t_val, st_val = member_day_slots[label]
+                j_val, t_val, st_val, pen_val = member_day_slots[label]
                 day_joining += _safe_int(j_val)
                 if st_val == "On Time":
                     row_cells.append(
                         f"Join: {j_val} ({t_val})" if j_val else f"On Time ({t_val})"
                     )
                 else:
+                    pen_tag = f"₹{pen_val}" if pen_val > 0 else st_val
                     row_cells.append(
-                        f"{st_val}: {j_val} ({t_val})" if j_val else f"{st_val} ({t_val})"
+                        f"{pen_tag}: {j_val} ({t_val})" if j_val else f"{pen_tag} ({t_val})"
                     )
             else:
                 row_cells.append("Missed")
@@ -1117,7 +1237,7 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
     )
 
     ws_all = wb.create_sheet(title="All History")
-    _style_sheet(ws_all, log_headers, all_rows, status_col_idx=6)
+    _style_sheet(ws_all, log_headers, all_excel_rows, status_col_idx=6)
 
     # 5th Sheet: Bot Config (persists Work Group ID, Excel Group ID, Reminders, Roster & Tags across Render restarts)
     ws_cfg = wb.create_sheet(title="Bot Config")
@@ -1170,12 +1290,14 @@ def restore_from_excel_bytes(excel_bytes: bytes) -> dict[str, object]:
     restored_excel_gid: Optional[int] = None
     now_iso = datetime.now(IST).isoformat()
     has_joining_col = False
+    has_penalty_col = False
 
     with sqlite3.connect(DB_PATH) as conn:
         for idx, row in enumerate(ws.iter_rows(values_only=True)):
             if idx == 0:
                 headers = [str(c or "").strip().lower() for c in (row or [])]
                 has_joining_col = len(headers) > 1 and headers[1] == "joining"
+                has_penalty_col = any("penalty" in h for h in headers)
                 continue
             if not row or not row[0]:
                 continue
@@ -1187,36 +1309,43 @@ def restore_from_excel_bytes(excel_bytes: bytes) -> dict[str, object]:
                 slot_label = str(row[3] or "").strip()
                 rep_date = str(row[4] or "").strip()
                 status = str(row[5] or "On Time").strip()
-                caption = str(row[6] or "").strip() if len(row) > 6 else ""
+                if has_penalty_col:
+                    pen_raw = str(row[6] or "0").replace("₹", "").strip()
+                    penalty_rs = _safe_int(pen_raw)
+                    caption = str(row[7] or "").strip() if len(row) > 7 else ""
+                else:
+                    penalty_rs = 0
+                    caption = str(row[6] or "").strip() if len(row) > 6 else ""
             else:
                 joining = ""
                 sub_time = str(row[1] or "").strip()
                 slot_label = str(row[2] or "").strip()
                 rep_date = str(row[3] or "").strip()
                 status = str(row[4] or "On Time").strip()
+                penalty_rs = 0
                 caption = str(row[5] or "").strip() if len(row) > 5 else ""
                 if not joining and caption:
                     _, joining = parse_report_fields(caption, username)
 
-            if status == "On Time" and sub_time and slot_label:
-                status = evaluate_slot_status_from_strings(sub_time, slot_label)
+            if sub_time and slot_label:
+                status, penalty_rs = evaluate_slot_status_from_strings_with_penalty(sub_time, slot_label)
 
             exists = conn.execute(
                 """
                 SELECT id, COALESCE(joining, '') FROM reports
-                WHERE LOWER(username) = LOWER(?) AND report_date = ? AND reporting_slot = ?
+                WHERE LOWER(LTRIM(username, '@')) = ? AND report_date = ? AND reporting_slot = ?
                 LIMIT 1
                 """,
-                (username, rep_date, slot_label),
+                (_match_key(username), rep_date, slot_label),
             ).fetchone()
             if not exists:
                 conn.execute(
                     """
                     INSERT INTO reports (
-                        user_id, username, joining, submission_time, reporting_slot, report_date, status, caption, created_at_utc
-                    ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                        user_id, username, joining, submission_time, reporting_slot, report_date, status, penalty_rs, caption, created_at_utc
+                    ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (username, joining, sub_time, slot_label, rep_date, status, caption, now_iso),
+                    (username, joining, sub_time, slot_label, rep_date, status, penalty_rs, caption, now_iso),
                 )
                 reports_restored += 1
             elif exists[1] == "" and joining != "":
@@ -1424,16 +1553,17 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                 rep_cols = {r[1] for r in src.execute("PRAGMA table_info(reports)").fetchall()}
                 uid_expr = "user_id" if "user_id" in rep_cols else "NULL"
                 join_expr = "COALESCE(joining, '')" if "joining" in rep_cols else "''"
+                pen_expr = "COALESCE(penalty_rs, 0)" if "penalty_rs" in rep_cols else "0"
                 cap_expr = "COALESCE(caption, '')" if "caption" in rep_cols else "''"
                 created_expr = "created_at_utc" if "created_at_utc" in rep_cols else f"'{now_iso}'"
                 rows = src.execute(
                     f"""
-                    SELECT {uid_expr}, username, {join_expr}, submission_time, reporting_slot, report_date, status, {cap_expr}, {created_expr}
+                    SELECT {uid_expr}, username, {join_expr}, submission_time, reporting_slot, report_date, status, {pen_expr}, {cap_expr}, {created_expr}
                     FROM reports
                     ORDER BY id ASC
                     """
                 ).fetchall()
-                for uid, uname, joining, sub_time, slot_lbl, rep_date, status, caption, created_utc in rows:
+                for uid, uname, joining, sub_time, slot_lbl, rep_date, status, pen_rs, caption, created_utc in rows:
                     u_str = str(uname).strip()
                     j_str = str(joining or "").strip()
                     cap_str = str(caption or "").strip()
@@ -1442,17 +1572,17 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                     exists = dst.execute(
                         """
                         SELECT id, COALESCE(joining, '') FROM reports
-                        WHERE LOWER(username) = LOWER(?) AND report_date = ? AND reporting_slot = ?
+                        WHERE LOWER(LTRIM(username, '@')) = ? AND report_date = ? AND reporting_slot = ?
                         LIMIT 1
                         """,
-                        (u_str, str(rep_date), str(slot_lbl)),
+                        (_match_key(u_str), str(rep_date), str(slot_lbl)),
                     ).fetchone()
                     if not exists:
                         dst.execute(
                             """
                             INSERT INTO reports (
-                                user_id, username, joining, submission_time, reporting_slot, report_date, status, caption, created_at_utc
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                user_id, username, joining, submission_time, reporting_slot, report_date, status, penalty_rs, caption, created_at_utc
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 uid,
@@ -1462,6 +1592,7 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                                 str(slot_lbl),
                                 str(rep_date),
                                 str(status or "On Time"),
+                                int(pen_rs or 0),
                                 cap_str,
                                 str(created_utc or now_iso),
                             ),
@@ -1607,10 +1738,11 @@ def _build_summary_view(today_str: str) -> tuple[str, InlineKeyboardMarkup]:
     hidden_keys = excluded_keys | admin_keys
 
     visible_rows = [r for r in rows if _match_key(r[0]) not in admin_keys]
+    total_team_penalty = sum(r[6] for r in visible_rows)
 
     lines = [
         f"<b>Daily Summary ({today_str} IST)</b>",
-        f"Total Slot Reports Recorded: {len(visible_rows)}",
+        f"Total Slot Reports: <b>{len(visible_rows)}</b> | Total Team Penalty: <b>₹{total_team_penalty}</b>",
         "",
     ]
 
@@ -1625,9 +1757,13 @@ def _build_summary_view(today_str: str) -> tuple[str, InlineKeyboardMarkup]:
         for name in all_names:
             u_rows = [r for r in visible_rows if _match_key(r[0]) == _match_key(name)]
             u_late = sum(1 for r in u_rows if r[5] != "On Time")
+            u_pen = sum(r[6] for r in u_rows)
             u_join = sum(_safe_int(r[1]) for r in u_rows)
             late_note = f" ({u_late} Late)" if u_late > 0 else ""
-            lines.append(f"- {html.escape(name)}: {len(u_rows)}/5 slots{late_note} | Joining: {u_join}")
+            pen_note = f" | Penalty: ₹{u_pen}" if u_pen > 0 else ""
+            lines.append(
+                f"- {html.escape(name)}: {len(u_rows)}/5 slots{late_note} | Joining: {u_join}{pen_note}"
+            )
 
     markup = InlineKeyboardMarkup(
         [
@@ -1723,6 +1859,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"<b>Backfill &amp; Excel Setup:</b>\n"
         f"/add (reply to any already-sent report) - Add with original timing\n"
         f"/addreport @user 40 [10am] - Manually add or bulk paste past reports\n"
+        f"/countdown [10am|1pm|3pm|5pm|final|stop] - Start/stop 15m penalty countdown\n"
         f"/removesummary @a | /restoresummary @a - Remove/restore name in Summary\n"
         f"/setworkgroup | /setexcelgroup | /check - Link &amp; diagnose groups\n"
         f"/excel [YYYY-MM-DD] | /weekly | /summary | /mystatus",
@@ -1738,6 +1875,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     excel_gid = get_excel_group_id()
     ist_now = datetime.now(IST)
     active_slot = detect_active_slot(ist_now)
+    resolved_slot, resolved_status, resolved_pen = resolve_submission_slot_and_penalty(ist_now)
     matches_work = work_gid is None or chat.id == work_gid
     same_as_excel = excel_gid is not None and chat.id == excel_gid and excel_gid != work_gid
     total_reports = await asyncio.to_thread(count_total_reports)
@@ -1755,6 +1893,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception as exc:
             pinned_backup_status = f"Cannot access Database Group ({exc})"
 
+    slot_display = active_slot or (f"{resolved_slot} [{resolved_status}]" if resolved_slot else "None (Before 10:00 AM)")
     lines = [
         "<b>Bot Diagnostic Check</b>",
         f"Current Chat ID: <code>{chat.id}</code> ({html.escape(chat.type)})",
@@ -1763,7 +1902,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Saved Data: <b>{total_reports}</b> reports | <b>{total_members}</b> assistants",
         f"Database Backup: {html.escape(pinned_backup_status)}",
         f"Current IST Time: <b>{ist_now.strftime('%Y-%m-%d %I:%M:%S %p IST')}</b>",
-        f"Active Slot Now: <b>{html.escape(active_slot or 'None (Outside slot hours)')}</b>",
+        f"Active Slot / Penalty Now: <b>{html.escape(slot_display)}</b> (₹{resolved_pen})",
         f"Report Recording Here: <b>{'YES' if (matches_work and not same_as_excel) else 'NO (Group Mismatch)'}</b>",
     ]
     if not matches_work:
@@ -1822,7 +1961,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if slot_label is None:
         slot_label = infer_slot_from_time(ist_dt)
 
-    status = evaluate_slot_status(ist_dt, slot_label)
+    status, penalty_rs = evaluate_slot_status_and_penalty(ist_dt, slot_label)
 
     action = await asyncio.to_thread(
         upsert_report_to_db,
@@ -1836,11 +1975,12 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         raw_text,
         orig_dt.isoformat(),
         True,
+        penalty_rs,
     )
 
     excel_caption = (
         f"Excel Updated ({action}) | {username} | Joining: {joining or 'N/A'} | {slot_label}\n"
-        f"Time: {submission_time} | Date: {report_date} | Status: {status}"
+        f"Time: {submission_time} | Date: {report_date} | Status: {status} | Penalty: ₹{penalty_rs}"
     )
     await push_excel_to_group(context, target_date=report_date, caption=excel_caption)
 
@@ -1849,7 +1989,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Username: <code>{html.escape(username)}</code>\n"
         f"Joining: <b>{html.escape(joining or 'N/A')}</b>\n"
         f"Timing: {html.escape(submission_time)} | Date: {report_date}\n"
-        f"Slot: {html.escape(slot_label)} | Status: <b>{html.escape(status)}</b>",
+        f"Slot: {html.escape(slot_label)} | Status: <b>{html.escape(status)}</b> (Penalty: ₹{penalty_rs})",
         parse_mode="HTML",
         reply_to_message_id=replied.message_id,
     )
@@ -1892,7 +2032,7 @@ async def addreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         slot_arg = parse_slot_alias(lines[0]) if lines else None
         slot_label = slot_arg or infer_slot_from_time(ist_now)
         sub_time = ist_now.strftime("%I:%M:%S %p IST")
-        status = evaluate_slot_status(ist_now, slot_label)
+        status, penalty_rs = evaluate_slot_status_and_penalty(ist_now, slot_label)
         await asyncio.to_thread(
             upsert_report_to_db,
             None,
@@ -1905,6 +2045,7 @@ async def addreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             joined_block,
             ist_now.isoformat(),
             True,
+            penalty_rs,
         )
         added_items.append(f"{u_name} | Joining: {j_val or 'N/A'} | {slot_label} ({status})")
     else:
@@ -1945,7 +2086,7 @@ async def addreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if slot_label is None:
                 slot_label = infer_slot_from_time(target_dt)
 
-            status = evaluate_slot_status(target_dt, slot_label)
+            status, penalty_rs = evaluate_slot_status_and_penalty(target_dt, slot_label)
 
             await asyncio.to_thread(
                 upsert_report_to_db,
@@ -1959,8 +2100,11 @@ async def addreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"Username- {norm_user}\nJoining- {joining}" if joining else norm_user,
                 target_dt.isoformat(),
                 True,
+                penalty_rs,
             )
-            added_items.append(f"{norm_user} | Joining: {joining or 'N/A'} | {slot_label} ({sub_time} | {status})")
+            added_items.append(
+                f"{norm_user} | Joining: {joining or 'N/A'} | {slot_label} ({sub_time} | {status})"
+            )
 
     if not added_items:
         await update.message.reply_text("No valid rows found. Example: <code>/addreport @Govind7549 40 10am</code>", parse_mode="HTML")
@@ -2349,12 +2493,19 @@ async def mystatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     submitted_map = await asyncio.to_thread(fetch_user_today_slots, username, today_str)
 
-    lines = [f"<b>Slot Status for {html.escape(username)} ({today_str})</b>"]
+    total_pen = sum(v[3] for v in submitted_map.values())
+    lines = [
+        f"<b>Slot Status for {html.escape(username)} ({today_str})</b>",
+        f"Total Penalty Today: <b>₹{total_pen}</b>",
+    ]
     for slot in REPORTING_SLOTS:
         if slot.label in submitted_map:
-            sub_t, j_val = submitted_map[slot.label]
+            sub_t, j_val, st_val, pen_val = submitted_map[slot.label]
             j_note = f" | Join: {html.escape(j_val)}" if j_val else ""
-            lines.append(f"- {html.escape(slot.label)}: Done ({html.escape(sub_t)}{j_note})")
+            pen_note = f" | <b>Penalty: ₹{pen_val}</b>" if pen_val > 0 else " | On Time (₹0)"
+            lines.append(
+                f"- {html.escape(slot.label)}: Done ({html.escape(sub_t)}{j_note}{pen_note})"
+            )
         else:
             lines.append(f"- {html.escape(slot.label)}: Pending")
 
@@ -2565,8 +2716,219 @@ async def handle_backup_document_upload(update: Update, context: ContextTypes.DE
 
 
 # ---------------------------------------------------------------------------
-# Scheduled Jobs (Daily Excel + Tagged Assistant Warnings)
+# Scheduled Jobs (Daily Excel + Tagged Assistant Warnings + 15-Min Animated Countdown)
 # ---------------------------------------------------------------------------
+_COUNTDOWN_ANIM_FRAMES: tuple[str, ...] = ("⏳🚨", "⌛⏰", "⏱🔔", "🔥⚡")
+
+
+def _get_slot_countdown_deadline(now_ist: datetime, slot_label: str) -> Optional[datetime]:
+    slot = _get_slot_by_label(slot_label)
+    if not slot:
+        return None
+    slot_end_dt = datetime.combine(now_ist.date(), slot.end, tzinfo=IST)
+    deadline_dt = slot_end_dt + timedelta(seconds=COUNTDOWN_DURATION_SECS)
+    if slot_end_dt < now_ist <= deadline_dt:
+        return deadline_dt
+    return None
+
+
+def _build_countdown_text(
+    slot_label: str,
+    today_str: str,
+    remaining_secs: int,
+    pending: list[tuple[str, Optional[int]]],
+    tick: int,
+    ended_early: bool = False,
+    deadline_dt: Optional[datetime] = None,
+) -> str:
+    if ended_early or not pending:
+        return (
+            f"🎉✅ <b>ALL CLEAR — {html.escape(slot_label)} ({today_str})</b>\n"
+            f"All tagged assistants have submitted their report before the 15-min countdown ended!\n"
+            f"👏 Great discipline!"
+        )
+
+    rem = max(0, remaining_secs)
+    mins, secs = divmod(rem, 60)
+    total = COUNTDOWN_DURATION_SECS
+    filled = max(0, min(12, round((rem / total) * 12)))
+    bar = "█" * filled + "░" * (12 - filled)
+    pct = round((rem / total) * 100)
+    anim = _COUNTDOWN_ANIM_FRAMES[tick % len(_COUNTDOWN_ANIM_FRAMES)]
+    tags_line = " ".join(_format_mention_html(u, uid) for u, uid in pending)
+    cutoff_str = deadline_dt.strftime("%I:%M %p IST") if deadline_dt else "00:00"
+
+    if rem > 0:
+        return (
+            f"{anim} <b>15-MINUTE PENALTY COUNTDOWN</b> — {html.escape(slot_label)}\n\n"
+            f"⏱ Time Remaining: <code>{mins:02d}:{secs:02d}</code>  <code>[{bar}]</code> <b>{pct}%</b>\n"
+            f"🕒 Deadline: <b>{html.escape(cutoff_str)}</b>\n\n"
+            f"🟡 Submit <b>BEFORE {html.escape(cutoff_str)} (00:00)</b>: <b>₹{PENALTY_COUNTDOWN_RS} Penalty ONLY</b>\n"
+            f"🔴 Submit <b>AFTER {html.escape(cutoff_str)}</b>: <b>₹{PENALTY_AFTER_COUNTDOWN_RS} Penalty</b>\n\n"
+            f"<b>Pending Assistants ({len(pending)}):</b>\n{tags_line}\n\n"
+            f"<i>Submit your report (Caption: Username + Joining) right now!</i>"
+        )
+
+    return (
+        f"🚨💥 <b>TIME UP (00:00) — ₹{PENALTY_AFTER_COUNTDOWN_RS} PENALTY ACTIVE!</b>\n"
+        f"Slot: <b>{html.escape(slot_label)}</b> ({today_str})\n\n"
+        f"<code>[░░░░░░░░░░░░]</code> <b>0%</b>\n"
+        f"🔴 Deadline ({html.escape(cutoff_str)}) ended. Any submission now will carry a <b>₹{PENALTY_AFTER_COUNTDOWN_RS} Penalty</b>.\n\n"
+        f"<b>Still Pending ({len(pending)}):</b>\n{tags_line}"
+    )
+
+
+async def _run_countdown_animation(
+    bot,
+    chat_id: int,
+    message_id: int,
+    slot_label: str,
+    today_str: str,
+    end_dt: datetime,
+) -> None:
+    key = (chat_id, slot_label)
+    tick = 1
+    try:
+        while True:
+            await asyncio.sleep(COUNTDOWN_REFRESH_SECS)
+            now_ist = datetime.now(IST)
+            remaining = int((end_dt - now_ist).total_seconds())
+            pending = await asyncio.to_thread(
+                get_pending_tagged_assistants_for_slot, today_str, slot_label
+            )
+
+            if not pending:
+                text = _build_countdown_text(
+                    slot_label, today_str, 0, [], tick, ended_early=True
+                )
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+                break
+
+            text = _build_countdown_text(
+                slot_label, today_str, max(0, remaining), pending, tick, deadline_dt=end_dt
+            )
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="HTML",
+                )
+            except Exception as exc:
+                err_msg = str(exc).lower()
+                if "message to edit not found" in err_msg or "chat not found" in err_msg:
+                    break
+            tick += 1
+            if remaining <= 0:
+                break
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _ACTIVE_COUNTDOWNS.pop(key, None)
+        _COUNTDOWN_TASKS.pop(key, None)
+
+
+async def refresh_active_countdown(bot, chat_id: int, slot_label: str) -> bool:
+    """Immediately update an active countdown message when a pending assistant submits a report.
+    Returns True if an active countdown was running and updated."""
+    key = (chat_id, slot_label)
+    state = _ACTIVE_COUNTDOWNS.get(key)
+    if not state:
+        return False
+    msg_id = int(state["message_id"])
+    today_str = str(state["today_str"])
+    end_dt = state["end_dt"]
+    if not isinstance(end_dt, datetime):
+        return False
+    remaining = max(0, int((end_dt - datetime.now(IST)).total_seconds()))
+    pending = await asyncio.to_thread(
+        get_pending_tagged_assistants_for_slot, today_str, slot_label
+    )
+    text = _build_countdown_text(
+        slot_label,
+        today_str,
+        remaining,
+        pending,
+        tick=remaining,
+        ended_early=(len(pending) == 0),
+        deadline_dt=end_dt,
+    )
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=text,
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    if not pending:
+        task = _COUNTDOWN_TASKS.pop(key, None)
+        _ACTIVE_COUNTDOWNS.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+    return True
+
+
+async def launch_penalty_countdown(
+    bot, chat_id: int, slot_label: str, force_even_if_empty: bool = False
+) -> bool:
+    await refresh_group_admins(bot, chat_id, force=True)
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    pending = await asyncio.to_thread(
+        get_pending_tagged_assistants_for_slot, today_str, slot_label
+    )
+    if not pending:
+        if force_even_if_empty:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"All tagged assistants have already submitted <b>{html.escape(slot_label)}</b> today!",
+                parse_mode="HTML",
+            )
+        return False
+
+    key = (chat_id, slot_label)
+    old_task = _COUNTDOWN_TASKS.pop(key, None)
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    anchored_deadline = _get_slot_countdown_deadline(now_ist, slot_label)
+    end_dt = anchored_deadline or (now_ist + timedelta(seconds=COUNTDOWN_DURATION_SECS))
+    initial_remaining = max(1, int((end_dt - now_ist).total_seconds()))
+
+    initial_text = _build_countdown_text(
+        slot_label, today_str, initial_remaining, pending, tick=0, deadline_dt=end_dt
+    )
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id, text=initial_text, parse_mode="HTML"
+        )
+    except Exception as exc:
+        logger.warning("Could not start penalty countdown in %s: %s", chat_id, exc)
+        return False
+
+    _ACTIVE_COUNTDOWNS[key] = {
+        "message_id": sent.message_id,
+        "end_dt": end_dt,
+        "today_str": today_str,
+    }
+    _COUNTDOWN_TASKS[key] = asyncio.create_task(
+        _run_countdown_animation(
+            bot, chat_id, sent.message_id, slot_label, today_str, end_dt
+        )
+    )
+    return True
+
+
 async def send_daily_excel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     excel_stream, today_count = await asyncio.to_thread(build_excel_bytes, today_str, 1)
@@ -2579,7 +2941,7 @@ async def send_daily_excel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 document=excel_stream,
                 filename=filename,
                 caption=(
-                    f"Daily Automated Excel Report ({today_str} | 8:30 PM IST)\n"
+                    f"Daily Automated Excel Report ({today_str} | 8:35 PM IST)\n"
                     f"Total slot submissions today: {today_count}"
                 ),
             )
@@ -2589,7 +2951,7 @@ async def send_daily_excel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await push_excel_to_group(
         context,
         target_date=today_str,
-        caption=f"Daily Closing Excel Report | {today_str} | 8:30 PM IST | Total today: {today_count}",
+        caption=f"Daily Closing Excel Report | {today_str} | 8:35 PM IST | Total today: {today_count}",
     )
 
 
@@ -2611,15 +2973,15 @@ async def send_slot_open_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> Non
         msg = (
             f"<b>WARNING &amp; REMINDER:</b> {html.escape(slot_label)} is now OPEN!\n"
             f"{attention_block}"
-            f"Please submit your report (Username + Joining) before 8:00 PM IST (grace ends 8:15 PM IST). "
-            f"Reports are ONLY recorded during active slot hours."
+            f"Submit your report (Username + Joining) before 8:15 PM IST for <b>On Time (₹0)</b>.\n"
+            f"After 8:15 PM IST, a 15-min countdown starts (<b>₹5 Penalty</b>, then <b>₹15 Penalty</b>)."
         )
     else:
         msg = (
             f"<b>WARNING &amp; REMINDER:</b> {html.escape(slot_label)} is now OPEN!\n"
             f"{attention_block}"
-            f"Submit your report (Username + Joining) within 15 minutes. "
-            f"Reports outside slot hours will NOT be recorded."
+            f"Submit within 15 minutes for <b>On Time (₹0)</b>.\n"
+            f"After 15 mins, a 15-min countdown starts: before 00:00 = <b>₹5 Penalty</b>, after = <b>₹15 Penalty</b>."
         )
 
     try:
@@ -2648,14 +3010,69 @@ async def send_slot_final_warning_job(context: ContextTypes.DEFAULT_TYPE) -> Non
 
     tags_line = " ".join(_format_mention_html(u, uid) for u, uid in pending)
     msg = (
-        f"<b>FINAL WARNING (5 MINUTES LEFT)</b> — {html.escape(slot_label)}\n"
+        f"<b>5 MINUTES LEFT (ON-TIME WINDOW)</b> — {html.escape(slot_label)}\n"
         f"Pending Assistants: {tags_line}\n"
-        f"Submit your report immediately! Slot closes in 5 minutes and will NOT record late uploads."
+        f"Submit in 5 mins for ₹0! After that, a 15-min ₹5 penalty countdown begins (then ₹15)."
     )
     try:
         await context.bot.send_message(chat_id=work_group_id, text=msg, parse_mode="HTML")
     except Exception as exc:
         logger.warning("Could not send 5-min final warning to %s: %s", work_group_id, exc)
+
+
+async def start_penalty_countdown_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_reminders_enabled() or not context.job:
+        return
+    work_group_id = get_work_group_id()
+    if work_group_id is None:
+        return
+    slot_label = str(context.job.data)
+    await launch_penalty_countdown(context.bot, work_group_id, slot_label)
+
+
+async def countdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /countdown [10am|1pm|3pm|5pm|final|stop] to trigger or stop the 15-min animated countdown."""
+    if not update.message or not update.effective_chat:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can control the penalty countdown.")
+        return
+
+    work_gid = get_work_group_id()
+    target_cid = (
+        update.effective_chat.id
+        if update.effective_chat.id < 0
+        else (work_gid or update.effective_chat.id)
+    )
+
+    arg = context.args[0].strip().lower() if context.args else ""
+    if arg == "stop":
+        stopped = 0
+        for key in list(_COUNTDOWN_TASKS.keys()):
+            if key[0] == target_cid:
+                t = _COUNTDOWN_TASKS.pop(key, None)
+                _ACTIVE_COUNTDOWNS.pop(key, None)
+                if t and not t.done():
+                    t.cancel()
+                stopped += 1
+        await update.message.reply_text(
+            f"Stopped {stopped} active countdown(s)." if stopped else "No active countdown running."
+        )
+        return
+
+    ist_now = datetime.now(IST)
+    slot_label = parse_slot_alias(arg) if arg else None
+    if slot_label is None:
+        slot_label = resolve_submission_slot_and_penalty(ist_now)[0] or REPORTING_SLOTS[0].label
+
+    started = await launch_penalty_countdown(
+        context.bot, target_cid, slot_label, force_even_if_empty=True
+    )
+    if started and update.effective_chat.id != target_cid:
+        await update.message.reply_text(
+            f"Started 15-min animated penalty countdown for <b>{html.escape(slot_label)}</b> in the Work Group.",
+            parse_mode="HTML",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2763,10 +3180,10 @@ async def send_celebration_reaction(
 
 async def handle_any_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Runs in handler group=-1 on EVERY work-group message (text, photo, command, join)
+    Runs in handler group=-1 on EVERY work-group message (new or edited, text, photo, command, join)
     so non-admin assistants are auto-recognized and Group Admins are always excluded.
     """
-    message = update.message
+    message = update.message or update.edited_message
     user = update.effective_user
     chat = update.effective_chat
     if not message or not user or not chat or user.is_bot:
@@ -2805,15 +3222,22 @@ async def handle_any_group_message(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Record Username, Joining, Timing & Caption ONLY for non-admin assistants when caption matches report format.
-    Random photos, admin photos, and messages without Username/Joining are silently ignored (zero reply spam).
+    Record Username, Joining, Timing, Caption & ₹0/₹5/₹15 Penalty for non-admin assistants
+    (supports new messages AND edited captions/messages). Random photos/admin posts are ignored.
     """
-    message = update.message
+    is_edited = update.message is None and update.edited_message is not None
+    message = update.message or update.edited_message
     user = update.effective_user
     chat = update.effective_chat
 
     if not message or not user or not chat or user.is_bot:
         return
+
+    # Skip backup archive uploads (.db/.sqlite/.xlsx) handled by backup handler
+    if message.document:
+        doc_name = (message.document.file_name or "").lower()
+        if doc_name.endswith(".db") or doc_name.endswith(".sqlite") or doc_name.endswith(".xlsx"):
+            return
 
     raw_caption = (message.caption or message.text or "").strip()
 
@@ -2849,20 +3273,19 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     fallback_user = sender_label or "Unknown User"
     username, joining = parse_report_fields(raw_caption, fallback_user)
-    effective_uid = user.id if username.lower() == fallback_user.lower() else None
+    effective_uid = user.id if _match_key(username) == _match_key(fallback_user) else None
 
     ist_dt = message.date.astimezone(IST)
     submission_time = ist_dt.strftime("%I:%M:%S %p IST")
     report_date = ist_dt.strftime("%Y-%m-%d")
-    active_slot = detect_active_slot(ist_dt)
+    active_slot, status, penalty_rs = resolve_submission_slot_and_penalty(ist_dt)
 
     if active_slot is None:
-        if message.media_group_id:
+        if not is_edited and message.media_group_id:
             mg_key = f"{chat.id}:{message.media_group_id}"
             if mg_key in _SEEN_MEDIA_GROUPS:
                 return
             _SEEN_MEDIA_GROUPS[mg_key] = datetime.now(IST)
-        # Quiet reaction only (no noisy reply spam outside slot hours)
         if ReactionTypeEmoji is not None:
             try:
                 await context.bot.set_message_reaction(
@@ -2876,7 +3299,7 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     async with _REPORT_LOCK:
-        if message.media_group_id:
+        if not is_edited and message.media_group_id:
             mg_key = f"{chat.id}:{message.media_group_id}"
             now_ist = datetime.now(IST)
             stale = [k for k, ts in _SEEN_MEDIA_GROUPS.items() if (now_ist - ts).total_seconds() > 600]
@@ -2889,24 +3312,25 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
         existing = await asyncio.to_thread(
             has_slot_submission, username, report_date, active_slot
         )
-        # Allow updating if previous slot entry had empty Joining and new message provides Joining
         should_update_missing_joining = bool(existing and existing[2] == "" and joining != "")
 
-        if PREVENT_DUPLICATE_SLOTS and existing and not should_update_missing_joining:
+        if PREVENT_DUPLICATE_SLOTS and existing and not should_update_missing_joining and not is_edited:
             await message.reply_text(
                 f"Duplicate skipped for {username}: {active_slot} was already recorded today at {existing[1]}.",
                 reply_to_message_id=message.message_id,
             )
             return
 
-        status = "On Time"
         logger.info(
-            "Slot report recorded | user=%s | joining=%s | chat=%s | time=%s | slot=%s",
+            "Slot report %s | user=%s | joining=%s | chat=%s | time=%s | slot=%s | status=%s | penalty=₹%s",
+            "edited" if is_edited else "recorded",
             username,
             joining,
             chat.id,
             submission_time,
             active_slot,
+            status,
+            penalty_rs,
         )
 
         try:
@@ -2922,6 +3346,7 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 raw_caption,
                 message.date.isoformat(),
                 True,
+                penalty_rs,
             )
         except Exception as exc:
             logger.exception("Failed to save report to database: %s", exc)
@@ -2931,11 +3356,20 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-    await send_celebration_reaction(context, chat.id, message.message_id, is_late=False)
+    await send_celebration_reaction(
+        context, chat.id, message.message_id, is_late=(penalty_rs > 0)
+    )
+    was_updated = await refresh_active_countdown(context.bot, chat.id, active_slot)
+    if (
+        not was_updated
+        and penalty_rs == PENALTY_COUNTDOWN_RS
+        and is_reminders_enabled()
+    ):
+        await launch_penalty_countdown(context.bot, chat.id, active_slot)
 
     excel_caption = (
         f"Excel Updated | {username} | Joining: {joining or 'N/A'} | {active_slot}\n"
-        f"Time: {submission_time} | Date: {report_date} | Status: {status}"
+        f"Time: {submission_time} | Date: {report_date} | Status: {status} | Penalty: ₹{penalty_rs}"
     )
     if raw_caption:
         excel_caption += f"\nCaption: {raw_caption}"
@@ -2943,11 +3377,18 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     join_line = f"\nJoining: {joining}" if joining else ""
     label_verb = "Updated" if action == "updated" else "Recorded"
+    if penalty_rs == 0:
+        header_badge = f"🎉🔥💯 🏆 ✅ <b>Report {label_verb}!</b>"
+        penalty_line = "Status: <b>On Time</b> (Penalty: <b>₹0</b>)"
+    else:
+        header_badge = f"⏰✅ <b>Late Report {label_verb}</b>"
+        penalty_line = f"Status: <b>{html.escape(status)}</b> (Penalty: <b>₹{penalty_rs}</b>)"
+
     confirmation = (
-        f"🎉🔥💯 🏆 ✅ <b>Report {label_verb}!</b>\n"
+        f"{header_badge}\n"
         f"Assistant: <code>{html.escape(username)}</code>{join_line}\n"
         f"Slot: {html.escape(active_slot)}\n"
-        f"Time: {html.escape(submission_time)} | Status: <b>{status}</b>"
+        f"Time: {html.escape(submission_time)} | {penalty_line}"
     )
     await message.reply_text(
         confirmation,
@@ -3038,7 +3479,22 @@ async def post_init(application: Application) -> None:
             name=f"reminder_warn_{slot.label}",
         )
 
-    logger.info("Scheduled daily Excel (20:30 IST), slot-open warnings, and 5-min final warnings.")
+        countdown_start_dt = datetime.combine(today_ist, slot.end, tzinfo=IST) + timedelta(seconds=1)
+        application.job_queue.run_daily(
+            start_penalty_countdown_job,
+            time=countdown_start_dt.timetz(),
+            data=slot.label,
+            name=f"penalty_countdown_{slot.label}",
+        )
+
+    # If bot starts/restarts mid-window (e.g. 10:16–10:30 IST), resume active countdown immediately
+    if work_gid is not None and is_reminders_enabled():
+        now_ist = datetime.now(IST)
+        for slot in REPORTING_SLOTS:
+            if _get_slot_countdown_deadline(now_ist, slot.label) is not None:
+                await launch_penalty_countdown(application.bot, work_gid, slot.label)
+
+    logger.info("Scheduled daily Excel (20:35 IST), slot warnings, and 15-min ₹5/₹15 penalty countdowns.")
 
 
 def main() -> None:
@@ -3051,11 +3507,20 @@ def main() -> None:
     init_db()
     start_health_server()
 
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
 
-    # Run assistant auto-discovery in group=-1 on ALL group messages before command/report handlers
+    # Run assistant auto-discovery in group=-1 on ALL group messages (new + edited)
     application.add_handler(
-        MessageHandler(filters.ChatType.GROUPS, handle_any_group_message),
+        MessageHandler(
+            (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE) & filters.ChatType.GROUPS,
+            handle_any_group_message,
+        ),
         group=-1,
     )
 
@@ -3063,6 +3528,7 @@ def main() -> None:
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler(["add", "record"], add_command))
     application.add_handler(CommandHandler("addreport", addreport_command))
+    application.add_handler(CommandHandler("countdown", countdown_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler(["tags", "assistants"], tags_command))
     application.add_handler(CommandHandler("settags", settags_command))
@@ -3086,12 +3552,17 @@ def main() -> None:
 
     # Auto-restore when Admin forwards/sends .db or .xlsx in Database Group or Admin DM
     application.add_handler(
-        MessageHandler(filters.Document.ALL & (filters.ChatType.GROUPS | filters.ChatType.PRIVATE), handle_backup_document_upload),
+        MessageHandler(
+            filters.Document.ALL & (filters.ChatType.GROUPS | filters.ChatType.PRIVATE),
+            handle_backup_document_upload,
+        ),
         group=1,
     )
 
-    group_report_filter = filters.ChatType.GROUPS & (
-        filters.PHOTO | filters.Document.IMAGE | (filters.TEXT & ~filters.COMMAND)
+    group_report_filter = (
+        (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
+        & filters.ChatType.GROUPS
+        & (filters.PHOTO | filters.Document.ALL | filters.VIDEO | (filters.TEXT & ~filters.COMMAND))
     )
     application.add_handler(MessageHandler(group_report_filter, handle_slot_report))
 

@@ -187,9 +187,14 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
     description: 'Sets the exact list of assistants to tag in reminders (/addtag, /removetag, /cleartags).',
   },
   {
+    command: '/countdown [10am|1pm|3pm|5pm|final|stop]',
+    scope: 'Admin Only',
+    description: 'Manually starts or stops the live 15-minute animated penalty countdown (before 00:00 = ₹5, after 00:00 = ₹15).',
+  },
+  {
     command: '/reminder on | off',
     scope: 'Admin Only',
-    description: 'Turns scheduled assistant-tagging reminders and 5-min warnings ON or OFF live.',
+    description: 'Turns scheduled assistant-tagging reminders, 5-min warnings, and 15-min ₹5/₹15 countdowns ON or OFF live.',
   },
   {
     command: '/setexcelgroup',
@@ -204,17 +209,17 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
   {
     command: '/excel [YYYY-MM-DD]',
     scope: 'Admin / Group',
-    description: 'Generates and sends the 4-sheet .xlsx workbook for today or a specific date.',
+    description: 'Generates and sends the 5-sheet .xlsx workbook (including Penalty ₹5 / ₹15 columns) for today or a specific date.',
   },
   {
     command: '/weekly',
     scope: 'Admin / Group',
-    description: 'Sends a 7-day consolidated Excel workbook with Total Joining and Member Compliance %.',
+    description: 'Sends a 7-day consolidated Excel workbook with Total Joining, Penalties, and Member Compliance %.',
   },
   {
     command: '/summary & /mystatus',
     scope: 'Group / DM',
-    description: 'Shows live slot submission counts, total joining, and an interactive button to remove/restore assistant names from Summary.',
+    description: 'Shows live slot submission counts, total joining, ₹5/₹15 penalty totals, and an interactive button to remove/restore assistant names.',
   },
   {
     command: '/removesummary @user | /restoresummary @user',
