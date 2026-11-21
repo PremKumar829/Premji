@@ -179,12 +179,12 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
   {
     command: '/tags (or /assistants)',
     scope: 'Admin Only',
-    description: 'Opens an interactive button panel in Telegram to toggle which auto-detected assistants get tagged.',
+    description: 'Opens paginated Assistant Tag Manager with Toggle Mode, 1-tap Bulk Delete Mode (❌), Clean Non-@ Junk (🧹), & Delete All OFF.',
   },
   {
-    command: '/settags @a @b',
+    command: '/settags, /removetags, /cleanjunktags & /keepassistants',
     scope: 'Admin Only',
-    description: 'Sets the exact list of assistants to tag in reminders (/addtag, /removetag, /cleartags).',
+    description: 'Bulk manage tags: /cleanjunktags removes all accidental non-@ Excel/code tags; /removetags @u1 @u2 (or multi-line) deletes permanently; /keepassistants @u1 @u2 keeps only listed assistants.',
   },
   {
     command: '/countdown [10am|1pm|3pm|5pm|final|stop]',

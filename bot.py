@@ -17,6 +17,7 @@ Requires: python-telegram-bot[job-queue] >= 21.0, openpyxl >= 3.1.5, python-dote
 """
 
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -1549,18 +1550,45 @@ def get_tagged_assistants_with_ids() -> list[tuple[str, Optional[int]]]:
         rows = conn.execute(
             "SELECT username, user_id FROM assistant_tags WHERE is_active = 1 ORDER BY username ASC"
         ).fetchall()
+        tm_rows = conn.execute(
+            "SELECT username, user_id FROM team_members WHERE user_id IS NOT NULL"
+        ).fetchall()
+        rep_rows = conn.execute(
+            "SELECT username, user_id FROM reports WHERE user_id IS NOT NULL"
+        ).fetchall()
+
+    uid_by_key: dict[str, int] = {}
+    for u, uid in tm_rows + rep_rows:
+        k = _match_key(u or "")
+        if k and uid is not None:
+            uid_by_key.setdefault(k, int(uid))
+    try:
+        raw_p = get_setting("dm_started_profiles", "{}")
+        prof = json.loads(raw_p or "{}")
+        if isinstance(prof, dict):
+            for k_uid, p_uname in prof.items():
+                if str(k_uid).lstrip("-").isdigit() and p_uname:
+                    pk = _match_key(str(p_uname))
+                    if pk:
+                        uid_by_key.setdefault(pk, int(k_uid))
+    except Exception:
+        pass
+
     by_key: dict[str, tuple[str, Optional[int]]] = {}
     for u, uid in rows:
         key = _match_key(u)
         if not key or key in admin_keys or (uid is not None and uid in admin_ids):
             continue
+        resolved_uid = int(uid) if uid is not None else uid_by_key.get(key)
+        if resolved_uid is not None and resolved_uid in admin_ids:
+            continue
         if key not in by_key:
-            by_key[key] = (u, uid)
+            by_key[key] = (u, resolved_uid)
         else:
             prev_u, prev_uid = by_key[key]
             by_key[key] = (
                 _pick_canonical_username([prev_u, u]),
-                uid if uid is not None else prev_uid,
+                resolved_uid if resolved_uid is not None else prev_uid,
             )
     return sorted(by_key.values(), key=lambda x: x[0].lower())
 
@@ -1569,12 +1597,45 @@ def get_tagged_assistants() -> list[str]:
     return [u for u, _uid in get_tagged_assistants_with_ids()]
 
 
+def _is_junk_tag_name(name: str) -> bool:
+    """True for accidental spreadsheet headers/invite codes/emojis (anything not a clean @username handle)."""
+    clean = (name or "").strip()
+    if not clean:
+        return True
+    if not clean.startswith("@"):
+        return True
+    handle = clean[1:]
+    if not handle or any(ch.isspace() for ch in handle):
+        return True
+    if not re.match(r"^[A-Za-z0-9_]{2,64}$", handle):
+        return True
+    return False
+
+
+def _tag_cb_token(member: str) -> str:
+    """Short callback token guaranteed <= 24 bytes even for long/emoji tag strings."""
+    return hashlib.sha1(member.encode("utf-8")).hexdigest()[:12]
+
+
+def _resolve_member_from_cb_token(token: str) -> Optional[str]:
+    all_members = _dedup_case_insensitive(get_team_members() + get_tagged_assistants())
+    for m in all_members:
+        if _tag_cb_token(m) == token or m == token:
+            return m
+    return None
+
+
 def add_assistant_tag(username: str) -> bool:
     norm = _normalize_tag(username)
     if not norm:
         return False
+    key = _match_key(norm)
     now_iso = datetime.now(IST).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM summary_excluded WHERE LOWER(LTRIM(username, '@')) = ?",
+            (key,),
+        )
         _, canon = _upsert_assistant_tag_case_insensitive(conn, norm, None, now_iso, force_active=1)
         _upsert_team_member_case_insensitive(conn, canon, None, now_iso)
         conn.commit()
@@ -1583,15 +1644,143 @@ def add_assistant_tag(username: str) -> bool:
 
 def remove_assistant_tag(username: str) -> bool:
     key = _match_key(username)
-    if not key:
+    raw_clean = (username or "").strip()
+    if not key and not raw_clean:
         return False
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "UPDATE assistant_tags SET is_active = 0 WHERE LOWER(LTRIM(username, '@')) = ?",
-            (key,),
+            "UPDATE assistant_tags SET is_active = 0 WHERE LOWER(LTRIM(username, '@')) = ? OR LOWER(username) = LOWER(?)",
+            (key, raw_clean),
         )
         conn.commit()
         return cur.rowcount > 0
+
+
+def purge_tag_entries(targets: list[str], delete_non_at_reports: bool = True) -> list[str]:
+    """Permanently remove matching tag/roster entries from assistant_tags & team_members (and bogus non-@ reports)."""
+    removed: list[str] = []
+    seen: set[str] = set()
+    now_iso = datetime.now(IST).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        for raw in targets:
+            clean = (raw or "").strip()
+            if not clean:
+                continue
+            key = _match_key(clean)
+            dedup_id = key or clean.lower()
+            if dedup_id in seen:
+                continue
+
+            matched_names = [
+                r[0]
+                for r in conn.execute(
+                    """
+                    SELECT username FROM assistant_tags WHERE LOWER(username) = LOWER(?) OR (? != '' AND LOWER(LTRIM(username, '@')) = ?)
+                    UNION
+                    SELECT username FROM team_members WHERE LOWER(username) = LOWER(?) OR (? != '' AND LOWER(LTRIM(username, '@')) = ?)
+                    """,
+                    (clean, key, key, clean, key, key),
+                ).fetchall()
+            ]
+            cur_t = conn.execute(
+                "DELETE FROM assistant_tags WHERE LOWER(username) = LOWER(?) OR (? != '' AND LOWER(LTRIM(username, '@')) = ?)",
+                (clean, key, key),
+            )
+            cur_m = conn.execute(
+                "DELETE FROM team_members WHERE LOWER(username) = LOWER(?) OR (? != '' AND LOWER(LTRIM(username, '@')) = ?)",
+                (clean, key, key),
+            )
+            cur_r_cnt = 0
+            if delete_non_at_reports and _is_junk_tag_name(clean):
+                cur_r = conn.execute(
+                    "DELETE FROM reports WHERE LOWER(username) = LOWER(?) OR (? != '' AND LOWER(LTRIM(username, '@')) = ?)",
+                    (clean, key, key),
+                )
+                cur_r_cnt = cur_r.rowcount
+
+            if cur_t.rowcount > 0 or cur_m.rowcount > 0 or cur_r_cnt > 0:
+                seen.add(dedup_id)
+                display_name = matched_names[0] if matched_names else clean
+                removed.append(display_name)
+                if not _is_junk_tag_name(display_name):
+                    has_reps = conn.execute(
+                        "SELECT 1 FROM reports WHERE LOWER(LTRIM(username, '@')) = ? LIMIT 1",
+                        (_match_key(display_name),),
+                    ).fetchone()
+                    if has_reps:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO summary_excluded (username, added_at) VALUES (?, ?)",
+                            (display_name, now_iso),
+                        )
+        conn.commit()
+    return removed
+
+
+def purge_non_at_junk_tags() -> list[str]:
+    """Delete all accidental non-@ / header / invite-code tags, roster rows, and bogus report rows."""
+    with sqlite3.connect(DB_PATH) as conn:
+        all_names = [
+            r[0]
+            for r in conn.execute(
+                """
+                SELECT DISTINCT username FROM assistant_tags
+                UNION
+                SELECT DISTINCT username FROM team_members
+                UNION
+                SELECT DISTINCT username FROM reports
+                """
+            ).fetchall()
+            if r[0]
+        ]
+    junk = [n for n in all_names if _is_junk_tag_name(n)]
+    if not junk:
+        return []
+    return purge_tag_entries(junk, delete_non_at_reports=True)
+
+
+def purge_inactive_tags() -> list[str]:
+    """Permanently delete all [OFF] / inactive tags from assistant_tags and team_members."""
+    active_keys = {_match_key(u) for u in get_tagged_assistants()}
+    with sqlite3.connect(DB_PATH) as conn:
+        all_names = [
+            r[0]
+            for r in conn.execute(
+                "SELECT username FROM assistant_tags UNION SELECT username FROM team_members"
+            ).fetchall()
+            if r[0]
+        ]
+    to_remove = [n for n in all_names if _match_key(n) not in active_keys]
+    if not to_remove:
+        return []
+    return purge_tag_entries(to_remove, delete_non_at_reports=True)
+
+
+def keep_only_assistants(keep_usernames: list[str]) -> tuple[list[str], list[str]]:
+    """Whitelist ONLY the given @usernames as active assistants/tags; purge all other tags & roster rows."""
+    cleaned = _dedup_case_insensitive([_normalize_tag(u) for u in keep_usernames if _normalize_tag(u)])
+    keep_keys = {_match_key(u) for u in cleaned}
+    with sqlite3.connect(DB_PATH) as conn:
+        existing_names = [
+            r[0]
+            for r in conn.execute(
+                "SELECT username FROM assistant_tags UNION SELECT username FROM team_members UNION SELECT DISTINCT username FROM reports"
+            ).fetchall()
+            if r[0]
+        ]
+    to_remove = [n for n in existing_names if _match_key(n) not in keep_keys]
+    removed = purge_tag_entries(to_remove, delete_non_at_reports=True) if to_remove else []
+
+    now_iso = datetime.now(IST).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        for norm in cleaned:
+            conn.execute(
+                "DELETE FROM summary_excluded WHERE LOWER(LTRIM(username, '@')) = ?",
+                (_match_key(norm),),
+            )
+            _, canon = _upsert_assistant_tag_case_insensitive(conn, norm, None, now_iso, force_active=1)
+            _upsert_team_member_case_insensitive(conn, canon, None, now_iso)
+        conn.commit()
+    return cleaned, removed
 
 
 def replace_assistant_tags(usernames: list[str]) -> list[str]:
@@ -1601,6 +1790,10 @@ def replace_assistant_tags(usernames: list[str]) -> list[str]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("UPDATE assistant_tags SET is_active = 0")
         for norm in cleaned:
+            conn.execute(
+                "DELETE FROM summary_excluded WHERE LOWER(LTRIM(username, '@')) = ?",
+                (_match_key(norm),),
+            )
             _, canon = _upsert_assistant_tag_case_insensitive(conn, norm, None, now_iso, force_active=1)
             _upsert_team_member_case_insensitive(conn, canon, None, now_iso)
         conn.commit()
@@ -2300,6 +2493,29 @@ def build_excel_bytes(
             "SELECT user_id, username FROM known_group_admins ORDER BY username ASC"
         ).fetchall():
             cfg_rows.append(("group_admin", str(uname or ""), str(uid if uid is not None else "")))
+        for gid_row in conn.execute(
+            "SELECT chat_id, title FROM tracked_chats WHERE role = 'work' ORDER BY chat_id ASC"
+        ).fetchall():
+            cfg_rows.append(("work_group_id_extra", str(gid_row[0]), str(gid_row[1] or "")))
+        for uname, sh_name in conn.execute(
+            "SELECT username, shift_name FROM assistant_shifts ORDER BY username ASC"
+        ).fetchall():
+            cfg_rows.append(("assistant_shift", str(uname), str(sh_name)))
+        for s_key in (
+            "clean_chat_mode",
+            "holiday_mode",
+            "off_days",
+            "fine_reset_date",
+            "fine_reset_time_secs",
+            "member_fine_reset_dates",
+        ):
+            s_val = get_setting(s_key, "")
+            if s_val:
+                cfg_rows.append((s_key, str(s_val), ""))
+
+    for dm_uid, dm_uname in sorted(get_dm_started_profiles().items()):
+        cfg_rows.append(("dm_started_profile", str(dm_uid), str(dm_uname or "")))
+
     _style_sheet(ws_cfg, ["Key", "Value", "Extra"], cfg_rows)
 
     output = BytesIO()
@@ -2322,76 +2538,93 @@ def restore_from_excel_bytes(excel_bytes: bytes) -> dict[str, object]:
     has_joining_col = False
     has_penalty_col = False
 
+    first_row = next(ws.iter_rows(values_only=True), None)
+    row0_headers = [str(c or "").strip().lower() for c in (first_row or [])]
+    has_bot_report_schema = (
+        "username" in row0_headers
+        and any(k in row0_headers for k in ("reporting slot", "submission time", "date"))
+    )
+    has_bot_config = "Bot Config" in wb.sheetnames
+    if not has_bot_report_schema and not has_bot_config:
+        raise ValueError(
+            "Not a bot report backup (.xlsx missing Username / Reporting Slot / Date columns)."
+        )
+
     with sqlite3.connect(DB_PATH) as conn:
-        for idx, row in enumerate(ws.iter_rows(values_only=True)):
-            if idx == 0:
-                headers = [str(c or "").strip().lower() for c in (row or [])]
-                has_joining_col = len(headers) > 1 and headers[1] == "joining"
-                has_penalty_col = any("penalty" in h for h in headers)
-                continue
-            if not row or not row[0]:
-                continue
+        if has_bot_report_schema:
+            for idx, row in enumerate(ws.iter_rows(values_only=True)):
+                if idx == 0:
+                    headers = [str(c or "").strip().lower() for c in (row or [])]
+                    has_joining_col = len(headers) > 1 and headers[1] == "joining"
+                    has_penalty_col = any("penalty" in h for h in headers)
+                    continue
+                if not row or not row[0]:
+                    continue
 
-            username = str(row[0]).strip()
-            if has_joining_col:
-                joining = str(row[1] or "").strip()
-                sub_time = str(row[2] or "").strip()
-                slot_label = str(row[3] or "").strip()
-                rep_date = str(row[4] or "").strip()
-                status = str(row[5] or "On Time").strip()
-                if has_penalty_col:
-                    pen_raw = str(row[6] or "0").replace("₹", "").strip()
-                    penalty_rs = _safe_int(pen_raw)
-                    caption = str(row[7] or "").strip() if len(row) > 7 else ""
+                username = str(row[0]).strip()
+                if has_joining_col:
+                    joining = str(row[1] or "").strip()
+                    sub_time = str(row[2] or "").strip()
+                    slot_label = str(row[3] or "").strip()
+                    rep_date = str(row[4] or "").strip()
+                    status = str(row[5] or "On Time").strip()
+                    if has_penalty_col:
+                        pen_raw = str(row[6] or "0").replace("₹", "").strip()
+                        penalty_rs = _safe_int(pen_raw)
+                        caption = str(row[7] or "").strip() if len(row) > 7 else ""
+                    else:
+                        penalty_rs = 0
+                        caption = str(row[6] or "").strip() if len(row) > 6 else ""
                 else:
+                    joining = ""
+                    sub_time = str(row[1] or "").strip()
+                    slot_label = str(row[2] or "").strip()
+                    rep_date = str(row[3] or "").strip()
+                    status = str(row[4] or "On Time").strip()
                     penalty_rs = 0
-                    caption = str(row[6] or "").strip() if len(row) > 6 else ""
-            else:
-                joining = ""
-                sub_time = str(row[1] or "").strip()
-                slot_label = str(row[2] or "").strip()
-                rep_date = str(row[3] or "").strip()
-                status = str(row[4] or "On Time").strip()
-                penalty_rs = 0
-                caption = str(row[5] or "").strip() if len(row) > 5 else ""
-                if not joining and caption:
-                    _, joining = parse_report_fields(caption, username)
+                    caption = str(row[5] or "").strip() if len(row) > 5 else ""
+                    if not joining and caption:
+                        _, joining = parse_report_fields(caption, username)
 
-            if sub_time and slot_label:
-                status, penalty_rs = evaluate_slot_status_from_strings_with_penalty(sub_time, slot_label)
+                if not slot_label or not re.match(r"^\d{4}-\d{2}-\d{2}$", rep_date):
+                    continue
 
-            exists = conn.execute(
-                """
-                SELECT id, COALESCE(joining, '') FROM reports
-                WHERE LOWER(LTRIM(username, '@')) = ? AND report_date = ? AND reporting_slot = ?
-                LIMIT 1
-                """,
-                (_match_key(username), rep_date, slot_label),
-            ).fetchone()
-            if not exists:
-                conn.execute(
+                if sub_time and slot_label:
+                    status, penalty_rs = evaluate_slot_status_from_strings_with_penalty(sub_time, slot_label)
+
+                exists = conn.execute(
                     """
-                    INSERT INTO reports (
-                        user_id, username, joining, submission_time, reporting_slot, report_date, status, penalty_rs, caption, created_at_utc
-                    ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    SELECT id, COALESCE(joining, '') FROM reports
+                    WHERE LOWER(LTRIM(username, '@')) = ? AND report_date = ? AND reporting_slot = ?
+                    LIMIT 1
                     """,
-                    (username, joining, sub_time, slot_label, rep_date, status, penalty_rs, caption, now_iso),
+                    (_match_key(username), rep_date, slot_label),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        """
+                        INSERT INTO reports (
+                            user_id, username, joining, submission_time, reporting_slot, report_date, status, penalty_rs, caption, created_at_utc
+                        ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (username, joining, sub_time, slot_label, rep_date, status, penalty_rs, caption, now_iso),
+                    )
+                    reports_restored += 1
+                elif exists[1] == "" and joining != "":
+                    conn.execute("UPDATE reports SET joining = ? WHERE id = ?", (joining, exists[0]))
+
+                cur_m = conn.execute(
+                    "INSERT OR IGNORE INTO team_members (username, user_id, added_at) VALUES (?, NULL, ?)",
+                    (username, now_iso),
                 )
-                reports_restored += 1
-            elif exists[1] == "" and joining != "":
-                conn.execute("UPDATE reports SET joining = ? WHERE id = ?", (joining, exists[0]))
+                members_restored += cur_m.rowcount
+                cur_t = conn.execute(
+                    "INSERT OR IGNORE INTO assistant_tags (username, user_id, is_active, added_at) VALUES (?, NULL, 1, ?)",
+                    (username, now_iso),
+                )
+                tags_restored += cur_t.rowcount
 
-            cur_m = conn.execute(
-                "INSERT OR IGNORE INTO team_members (username, user_id, added_at) VALUES (?, NULL, ?)",
-                (username, now_iso),
-            )
-            members_restored += cur_m.rowcount
-            cur_t = conn.execute(
-                "INSERT OR IGNORE INTO assistant_tags (username, user_id, is_active, added_at) VALUES (?, NULL, 1, ?)",
-                (username, now_iso),
-            )
-            tags_restored += cur_t.rowcount
-
+        restored_dm_profiles: list[tuple[int, str]] = []
         if "Bot Config" in wb.sheetnames:
             ws_cfg = wb["Bot Config"]
             for idx, row in enumerate(ws_cfg.iter_rows(values_only=True)):
@@ -2409,6 +2642,13 @@ def restore_from_excel_bytes(excel_bytes: bytes) -> dict[str, object]:
                             "INSERT INTO bot_settings (key, value) VALUES ('work_group_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                             (str(parsed),),
                         )
+                elif k == "work_group_id_extra" and v:
+                    parsed = _parse_optional_int(v, "work_group_id_extra")
+                    if parsed is not None:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO tracked_chats (chat_id, title, role, added_at) VALUES (?, ?, 'work', ?)",
+                            (parsed, extra or "Work Group", now_iso),
+                        )
                 elif k == "excel_group_id" and v:
                     parsed = _parse_optional_int(v, "excel_group_id")
                     if parsed is not None:
@@ -2422,9 +2662,34 @@ def restore_from_excel_bytes(excel_bytes: bytes) -> dict[str, object]:
                         "INSERT INTO bot_settings (key, value) VALUES ('reminders_enabled', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                         (v,),
                     )
+                elif k in (
+                    "clean_chat_mode",
+                    "holiday_mode",
+                    "off_days",
+                    "daily_joining_target",
+                    "per_joining_rate",
+                    "fine_reset_date",
+                    "fine_reset_time_secs",
+                    "member_fine_reset_dates",
+                ) and v:
+                    conn.execute(
+                        "INSERT INTO bot_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (k, v),
+                    )
+                elif k == "dm_started_profile" and v:
+                    uid_val = _parse_optional_int(v, "dm_started_uid")
+                    if uid_val is not None:
+                        restored_dm_profiles.append((uid_val, extra))
+                elif k == "assistant_shift" and v and extra:
+                    ukey = _match_key(v)
+                    if ukey:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO assistant_shifts (username_key, username, shift_name, updated_at) VALUES (?, ?, ?, ?)",
+                            (ukey, v, extra, now_iso),
+                        )
                 elif k == "member_tag" and v:
                     active_flag = 1
-                    uid_val: Optional[int] = None
+                    uid_val = None
                     for part in extra.split(";"):
                         if part.startswith("active="):
                             active_flag = 1 if part.split("=", 1)[1].strip() == "1" else 0
@@ -2467,6 +2732,9 @@ def restore_from_excel_bytes(excel_bytes: bytes) -> dict[str, object]:
         recalculate_report_statuses(conn)
         conn.commit()
 
+    for dm_uid, dm_uname in restored_dm_profiles:
+        mark_user_dm_started(dm_uid, dm_uname)
+
     return {
         "source": "excel",
         "reports": reports_restored,
@@ -2497,6 +2765,8 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                 r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             }
 
+            src_dm_uids: set[int] = set()
+            src_dm_profiles: dict[int, str] = {}
             if "bot_settings" in tables:
                 for key, val in src.execute("SELECT key, value FROM bot_settings").fetchall():
                     if key == "work_group_id" and val:
@@ -2515,6 +2785,25 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                                 "INSERT INTO bot_settings (key, value) VALUES ('excel_group_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                                 (str(parsed),),
                             )
+                    elif key == "dm_started_users" and val:
+                        try:
+                            arr = json.loads(str(val))
+                            if isinstance(arr, list):
+                                for x in arr:
+                                    if str(x).lstrip("-").isdigit():
+                                        src_dm_uids.add(int(x))
+                        except Exception:
+                            pass
+                    elif key == "dm_started_profiles" and val:
+                        try:
+                            prof = json.loads(str(val))
+                            if isinstance(prof, dict):
+                                for pk, pv in prof.items():
+                                    if str(pk).lstrip("-").isdigit():
+                                        src_dm_profiles[int(pk)] = str(pv or "")
+                                        src_dm_uids.add(int(pk))
+                        except Exception:
+                            pass
                     elif key in (
                         "reminders_enabled",
                         "clean_chat_mode",
@@ -2525,8 +2814,6 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                         "penalty_late_regular",
                         "penalty_late_final",
                         "penalty_missed",
-                        "dm_started_users",
-                        "dm_started_profiles",
                         "fine_reset_date",
                         "fine_reset_time_secs",
                         "member_fine_reset_dates",
@@ -2659,6 +2946,9 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
             deduplicate_case_insensitive_records(dst)
             recalculate_report_statuses(dst)
             dst.commit()
+
+        for dm_uid in sorted(src_dm_uids):
+            mark_user_dm_started(dm_uid, src_dm_profiles.get(dm_uid, ""))
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -2721,12 +3011,23 @@ async def push_excel_to_group(
 # ---------------------------------------------------------------------------
 # Interactive Assistant Tag Menu Builder (/tags) — Safe HTML
 # ---------------------------------------------------------------------------
-def _build_tags_panel(current_chat_id: Optional[int] = None) -> tuple[str, InlineKeyboardMarkup]:
+def _build_tags_panel(
+    current_chat_id: Optional[int] = None,
+    mode: str = "toggle",
+    page: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
     members = _dedup_case_insensitive(get_team_members() + get_tagged_assistants())
     tagged = get_tagged_assistants()
     tagged_keys = {_match_key(u) for u in tagged}
+    junk_count = sum(1 for m in members if _is_junk_tag_name(m))
+    off_count = sum(1 for m in members if _match_key(m) not in tagged_keys)
     rem_on = is_reminders_enabled()
     work_gid = get_work_group_id()
+
+    page_size = 20
+    total_pages = max(1, (len(members) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    page_members = members[page * page_size : (page + 1) * page_size]
 
     tagged_str = ", ".join(html.escape(t) for t in tagged) if tagged else "None selected"
     mismatch_warn = ""
@@ -2736,24 +3037,33 @@ def _build_tags_panel(current_chat_id: Optional[int] = None) -> tuple[str, Inlin
             f"configured Work Group (<code>{work_gid}</code>). Run <code>/setworkgroup</code> here!"
         )
 
+    is_del_mode = mode == "del"
+    mode_banner = (
+        "🗑 <b>BULK DELETE MODE ON</b> — Kisi bhi button par tap karne se wo tag/name <b>permanently delete</b> ho jayega!\n\n"
+        if is_del_mode
+        else "Tap below to toggle ON/OFF, or use <b>Bulk Delete Mode</b> / <b>Clean Non-@ Junk</b>:\n"
+    )
+
     text = (
-        f"<b>Assistant Tag Manager</b>\n"
+        f"<b>Assistant Tag Manager</b> (Total: {len(members)} | Page {page + 1}/{total_pages})\n"
         f"Reminders Status: <b>{'ON' if rem_on else 'OFF'}</b>\n"
         f"Currently Tagged ({len(tagged)}): {tagged_str}\n\n"
-        f"Assistants are auto-discovered when they send any message in the work group.\n"
-        f"<i>Tip: Make the bot Admin in the work group so Telegram sends text messages like 'Hi' to the bot.</i>\n\n"
-        f"Tap below to toggle tagging, or use <code>/settags @user1 @user2</code>:"
+        f"{mode_banner}"
+        f"<i>Commands: /cleanjunktags | /removetags @u1 @u2 | /keepassistants @u1 @u2</i>"
         f"{mismatch_warn}"
     )
 
     keyboard: list[list[InlineKeyboardButton]] = []
     row_buf: list[InlineKeyboardButton] = []
-    for member in members[:30]:
+    for member in page_members:
         is_tagged = _match_key(member) in tagged_keys
-        label = f"[ON] {member}" if is_tagged else f"[OFF] {member}"
-        cb_val = f"tag_toggle:{member}"
-        if len(cb_val.encode("utf-8")) > 64:
-            continue
+        tok = _tag_cb_token(member)
+        if is_del_mode:
+            label = f"❌ {member[:22]}"
+            cb_val = f"tag_del:{tok}:{page}"
+        else:
+            label = f"{'[ON]' if is_tagged else '[OFF]'} {member[:20]}"
+            cb_val = f"tag_tog:{tok}:{page}"
         row_buf.append(InlineKeyboardButton(label, callback_data=cb_val))
         if len(row_buf) == 2:
             keyboard.append(row_buf)
@@ -2761,13 +3071,48 @@ def _build_tags_panel(current_chat_id: Optional[int] = None) -> tuple[str, Inlin
     if row_buf:
         keyboard.append(row_buf)
 
+    if total_pages > 1:
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"tag_page:{mode}:{page - 1}"))
+        if page + 1 < total_pages:
+            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"tag_page:{mode}:{page + 1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+
+    bulk_row1: list[InlineKeyboardButton] = [
+        InlineKeyboardButton(
+            "✅ Done (Back to Toggle)" if is_del_mode else "🗑 Bulk Delete Mode",
+            callback_data=f"tag_mode:{'toggle' if is_del_mode else 'del'}:{page}",
+        )
+    ]
+    if junk_count > 0:
+        bulk_row1.append(
+            InlineKeyboardButton(
+                f"🧹 Clean Non-@ Junk ({junk_count})",
+                callback_data=f"tag_purge_nonat_ask:{mode}:{page}",
+            )
+        )
+    keyboard.append(bulk_row1)
+
+    bulk_row2: list[InlineKeyboardButton] = []
+    if off_count > 0:
+        bulk_row2.append(
+            InlineKeyboardButton(
+                f"🗑 Delete All OFF ({off_count})",
+                callback_data=f"tag_purge_off_ask:{mode}:{page}",
+            )
+        )
+    bulk_row2.append(InlineKeyboardButton("Clear All Tags", callback_data=f"tag_clear:{mode}:{page}"))
+    keyboard.append(bulk_row2)
+
     keyboard.append(
         [
             InlineKeyboardButton(
                 f"Reminders: {'ON' if rem_on else 'OFF'} (Tap to Toggle)",
-                callback_data="rem_toggle",
+                callback_data=f"rem_toggle:{mode}:{page}",
             ),
-            InlineKeyboardButton("Clear All Tags", callback_data="tag_clear"),
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"tag_page:{mode}:{page}"),
         ]
     )
     return text, InlineKeyboardMarkup(keyboard)
@@ -3067,7 +3412,8 @@ def mark_user_dm_started(user_id: Optional[int], username: str = "") -> None:
         arr.append(uid_int)
         set_setting("dm_started_users", json.dumps(arr))
 
-    if username:
+    clean_u = _normalize_tag(username) or username.strip() if username else ""
+    if clean_u and not clean_u.startswith("User "):
         raw_p = get_setting("dm_started_profiles", "{}")
         try:
             prof = json.loads(raw_p or "{}")
@@ -3075,10 +3421,22 @@ def mark_user_dm_started(user_id: Optional[int], username: str = "") -> None:
                 prof = {}
         except Exception:
             prof = {}
-        clean_u = _normalize_tag(username) or username.strip()
         if prof.get(str(uid_int)) != clean_u:
             prof[str(uid_int)] = clean_u
             set_setting("dm_started_profiles", json.dumps(prof))
+
+        mkey = _match_key(clean_u)
+        if mkey:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE assistant_tags SET user_id = ? WHERE LOWER(LTRIM(username, '@')) = ? AND user_id IS NULL",
+                    (uid_int, mkey),
+                )
+                conn.execute(
+                    "UPDATE team_members SET user_id = ? WHERE LOWER(LTRIM(username, '@')) = ? AND user_id IS NULL",
+                    (uid_int, mkey),
+                )
+                conn.commit()
 
 
 def get_dm_started_user_ids() -> set[int]:
@@ -3106,11 +3464,63 @@ def get_dm_started_profiles() -> dict[int, str]:
     # Also enrich display usernames from assistant_tags / team_members if available
     with sqlite3.connect(DB_PATH) as conn:
         for uid, uname in conn.execute(
-            "SELECT user_id, username FROM assistant_tags WHERE user_id IS NOT NULL UNION SELECT user_id, username FROM team_members WHERE user_id IS NOT NULL"
+            "SELECT user_id, username FROM assistant_tags WHERE user_id IS NOT NULL UNION SELECT user_id, username FROM team_members WHERE user_id IS NOT NULL UNION SELECT user_id, username FROM reports WHERE user_id IS NOT NULL"
         ).fetchall():
             if uid is not None and int(uid) in out and uname:
                 out[int(uid)] = str(uname)
     return out
+
+
+async def sync_already_started_dm_users(bot) -> tuple[int, int]:
+    """
+    Silently probe known non-admin assistants (who have a Telegram user_id from work group or backup)
+    that are not yet in dm_started_users via zero-notification send_chat_action('typing').
+    If Telegram accepts it, they already clicked /start earlier -> auto-restore into dm_started_users!
+    """
+    started_ids = await asyncio.to_thread(get_dm_started_user_ids)
+    admin_ids, admin_keys = await asyncio.to_thread(get_known_admin_sets)
+
+    def _gather_candidates() -> list[tuple[int, str]]:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, username FROM assistant_tags WHERE user_id IS NOT NULL
+                UNION
+                SELECT user_id, username FROM team_members WHERE user_id IS NOT NULL
+                UNION
+                SELECT user_id, username FROM reports WHERE user_id IS NOT NULL
+                """
+            ).fetchall()
+        by_uid: dict[int, str] = {}
+        for uid_raw, uname_raw in rows:
+            if uid_raw is None:
+                continue
+            uid = int(uid_raw)
+            uname = str(uname_raw or "").strip()
+            if uid in started_ids or uid in admin_ids:
+                continue
+            if DEFAULT_ADMIN_CHAT_ID is not None and uid == DEFAULT_ADMIN_CHAT_ID:
+                continue
+            if uname and _match_key(uname) in admin_keys:
+                continue
+            if uid not in by_uid or (uname and not by_uid[uid]):
+                by_uid[uid] = uname or f"User {uid}"
+        return list(by_uid.items())
+
+    candidates = await asyncio.to_thread(_gather_candidates)
+    recovered = 0
+    for uid, uname in candidates:
+        try:
+            await bot.send_chat_action(chat_id=uid, action="typing")
+            await asyncio.to_thread(mark_user_dm_started, uid, uname)
+            recovered += 1
+        except Exception as exc:
+            low = str(exc).lower()
+            if "retry after" in low:
+                await asyncio.sleep(1.0)
+                continue
+        await asyncio.sleep(0.05)
+    return recovered, len(candidates)
 
 
 def _assistant_commands_text(uname: str, dm_activated: bool = False) -> str:
@@ -3160,6 +3570,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(_assistant_commands_text(uname, dm_activated=dm_on), parse_mode="HTML")
         return
 
+    if _is_admin(update):
+        await sync_already_started_dm_users(context.bot)
     rem_status = "ON" if is_reminders_enabled() else "OFF"
     clean_status = "ON" if is_clean_chat_enabled() else "OFF"
     dm_started_count = len(get_dm_started_user_ids())
@@ -3188,7 +3600,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"/dmstatus | /dmtest @assistant | /dmall [message]\n\n"
         f"<b>Admin Controls &amp; Backfill:</b>\n"
         f"/add (reply) | /addreport @user 40 [10am]\n"
-        f"/tags | /settags @a @b | /addtag | /removetag | /cleartags\n"
+        f"/tags | /settags @a @b | /removetags @a @b | /cleanjunktags | /keepassistants @a @b\n"
         f"/reminder on|off | /cleanchat on|off | /countdown [slot|stop]\n"
         f"/leave @user [date] [slot] | /unleave @user [date] | /setshift @user morning|evening|full\n"
         f"/settarget N | /setrate Rs | /setpenalty regular 5 final 10 missed 15\n"
@@ -3523,28 +3935,143 @@ async def addtag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+def _parse_bulk_tag_targets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    """Parse space-, comma-, or newline-separated tag/member targets (supporting multi-word spreadsheet headers)."""
+    full_text = (update.message.text or "").strip() if update.message else ""
+    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+    if lines:
+        lines[0] = re.sub(r"^/\w+(?:@\w+)?", "", lines[0]).strip()
+        lines = [ln for ln in lines if ln]
+
+    if len(lines) > 1:
+        items: list[str] = []
+        for ln in lines:
+            if "," in ln:
+                items.extend(p.strip() for p in ln.split(",") if p.strip())
+            else:
+                items.append(ln)
+        return items
+
+    raw_single = lines[0] if lines else " ".join(context.args or []).strip()
+    if not raw_single:
+        return []
+    if "," in raw_single:
+        return [p.strip() for p in raw_single.split(",") if p.strip()]
+    tokens = [tok.strip() for tok in raw_single.split() if tok.strip()]
+    if len(tokens) > 1 and not all(tok.startswith("@") for tok in tokens):
+        # Include both exact multi-word phrase AND individual tokens so "/removetag Invitation Code" or "/removetags code1 code2" both work!
+        return [raw_single] + tokens
+    return tokens
+
+
 async def removetag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     if not _is_admin(update):
         await update.message.reply_text("Only the configured admin can modify assistant tags.")
         return
-    if not context.args:
-        await update.message.reply_text("Usage: <code>/removetag @assistant1</code>", parse_mode="HTML")
+
+    targets = _parse_bulk_tag_targets(update, context)
+    if not targets:
+        await update.message.reply_text(
+            "<b>Bulk Tag Removal Options:</b>\n"
+            "• <code>/cleanjunktags</code> (ya <code>/removetag junk</code>) — Saare non-@ galti se add hue tags ek saath delete karein\n"
+            "• <code>/removetag off</code> — Saare [OFF] tags delete karein\n"
+            "• <code>/removetags @u1 @u2 code1</code> — Multiple tags ek saath delete karein\n"
+            "• <code>/keepassistants @u1 @u2 ...</code> — Sirf asli assistants rakhein, baaki sab hata dein\n"
+            "• Ya <code>/tags</code> -&gt; <b>🗑 Bulk Delete Mode</b> / <b>🧹 Clean Non-@ Junk</b> dabayein!",
+            parse_mode="HTML",
+        )
         return
 
-    removed = []
-    for raw in context.args:
-        if await asyncio.to_thread(remove_assistant_tag, raw):
-            removed.append(raw)
+    first_low = targets[0].lower()
+    if len(targets) == 1 and first_low in ("nonat", "junk", "invalid", "non-@", "garbage"):
+        removed = await asyncio.to_thread(purge_non_at_junk_tags)
+        tagged = await asyncio.to_thread(get_tagged_assistants)
+        if removed:
+            shown = ", ".join(html.escape(x) for x in removed[:25])
+            extra = f" (+{len(removed) - 25} more)" if len(removed) > 25 else ""
+            await update.message.reply_text(
+                f"🧹 <b>Cleaned {len(removed)} Non-@ Junk Tag(s)!</b>\nRemoved: {shown}{extra}\n"
+                f"Active @Assistants ({len(tagged)}): {', '.join(html.escape(t) for t in tagged) or 'None'}",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text("Koi non-@ junk tag nahi mila.")
+        return
 
+    if len(targets) == 1 and first_low == "off":
+        removed = await asyncio.to_thread(purge_inactive_tags)
+        tagged = await asyncio.to_thread(get_tagged_assistants)
+        if removed:
+            await update.message.reply_text(
+                f"🗑 <b>Deleted {len(removed)} [OFF] Tag(s)!</b>\nActive Tags ({len(tagged)}): {', '.join(html.escape(t) for t in tagged) or 'None'}",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text("Koi [OFF] tag nahi mila.")
+        return
+
+    if len(targets) == 1 and first_low == "all":
+        await asyncio.to_thread(clear_assistant_tags)
+        await update.message.reply_text("All tags set to OFF. Use <code>/removetag off</code> or <code>/tags</code> -&gt; Delete All OFF to purge permanently.", parse_mode="HTML")
+        return
+
+    removed = await asyncio.to_thread(purge_tag_entries, targets, True)
     tagged = await asyncio.to_thread(get_tagged_assistants)
     if removed:
         await update.message.reply_text(
-            f"Removed from assistant tags: {', '.join(removed)}\nActive tags: {', '.join(tagged) or 'None'}"
+            f"✅ <b>Permanently Removed {len(removed)} Tag(s):</b> {', '.join(html.escape(r) for r in removed[:30])}\n"
+            f"Active tags ({len(tagged)}): {', '.join(html.escape(t) for t in tagged) or 'None'}",
+            parse_mode="HTML",
         )
     else:
-        await update.message.reply_text("No matching assistant found in active tags.")
+        await update.message.reply_text("No matching assistant/tag found.")
+
+
+async def cleanjunktags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin shortcut /cleanjunktags — remove all accidental non-@ Excel/invite-code tags in 1 command."""
+    if not update.message:
+        return
+    if not await _require_admin(update):
+        return
+    removed = await asyncio.to_thread(purge_non_at_junk_tags)
+    tagged = await asyncio.to_thread(get_tagged_assistants)
+    if removed:
+        shown = ", ".join(html.escape(x) for x in removed[:25])
+        extra = f" (+{len(removed) - 25} more)" if len(removed) > 25 else ""
+        await update.message.reply_text(
+            f"🧹 <b>Purged {len(removed)} Non-@ Junk Entry(ies)!</b>\n"
+            f"Deleted: {shown}{extra}\n\n"
+            f"Remaining Real Assistants ({len(tagged)}): {', '.join(html.escape(t) for t in tagged) or 'None'}",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text("✅ Koi non-@ junk tag nahi hai — list pehle se clean hai!")
+
+
+async def keepassistants_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /keepassistants @a @b ... — keep ONLY listed @assistants and remove everyone else."""
+    if not update.message:
+        return
+    if not await _require_admin(update):
+        return
+    raw_items = [part.strip() for arg in (context.args or []) for part in arg.split(",") if part.strip()]
+    if not raw_items:
+        await update.message.reply_text(
+            "Usage: <code>/keepassistants @Addyxhere @Chhotu1717 @Govind7549 @Misuif ...</code>\n"
+            "<i>Sirf ye assistants rahenge, baaki saare extra/galti tags ek saath remove ho jayenge.</i>",
+            parse_mode="HTML",
+        )
+        return
+    kept, removed = await asyncio.to_thread(keep_only_assistants, raw_items)
+    await update.message.reply_text(
+        f"✅ <b>Assistant List Cleaned!</b>\n"
+        f"Kept ({len(kept)}): {', '.join(html.escape(u) for u in kept)}\n"
+        f"Removed ({len(removed)}): {', '.join(html.escape(u) for u in removed[:20]) or 'None'}"
+        + (f" (+{len(removed) - 20} more)" if len(removed) > 20 else ""),
+        parse_mode="HTML",
+    )
 
 
 async def cleartags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3553,9 +4080,13 @@ async def cleartags_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not _is_admin(update):
         await update.message.reply_text("Only the configured admin can clear assistant tags.")
         return
+    if context.args and context.args[0].strip().lower() == "off":
+        removed = await asyncio.to_thread(purge_inactive_tags)
+        await update.message.reply_text(f"🗑 Deleted {len(removed)} [OFF] tag(s) permanently.")
+        return
     await asyncio.to_thread(clear_assistant_tags)
     await update.message.reply_text(
-        "All assistant tags cleared. Use <code>/tags</code> or <code>/settags @user</code> to add again.",
+        "All assistant tags set to OFF. Use <code>/tags</code> -&gt; <b>🗑 Delete All OFF</b> or <code>/removetag off</code> to delete them permanently.",
         parse_mode="HTML",
     )
 
@@ -3661,15 +4192,104 @@ async def tags_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             pass
         return
 
-    if data.startswith("tag_toggle:"):
+    panel_mode = "toggle"
+    panel_page = 0
+    if data.startswith("tag_tog:"):
+        parts = data.split(":")
+        tok = parts[1] if len(parts) > 1 else ""
+        panel_page = _safe_int(parts[2]) if len(parts) > 2 else 0
+        member = await asyncio.to_thread(_resolve_member_from_cb_token, tok)
+        if member:
+            is_now_tagged = await asyncio.to_thread(toggle_assistant_tag, member)
+            await query.answer(f"{member}: {'Tagged' if is_now_tagged else 'Untagged'}")
+        else:
+            await query.answer("Entry not found")
+    elif data.startswith("tag_del:"):
+        parts = data.split(":")
+        tok = parts[1] if len(parts) > 1 else ""
+        panel_page = _safe_int(parts[2]) if len(parts) > 2 else 0
+        panel_mode = "del"
+        member = await asyncio.to_thread(_resolve_member_from_cb_token, tok)
+        if member:
+            await asyncio.to_thread(purge_tag_entries, [member], True)
+            await query.answer(f"Deleted {member}!")
+        else:
+            await query.answer("Already deleted")
+    elif data.startswith("tag_toggle:"):
         member = data.split("tag_toggle:", 1)[1]
         is_now_tagged = await asyncio.to_thread(toggle_assistant_tag, member)
         await query.answer(f"{member}: {'Tagged' if is_now_tagged else 'Untagged'}")
-    elif data == "rem_toggle":
+    elif data.startswith("tag_mode:"):
+        parts = data.split(":")
+        panel_mode = parts[1] if len(parts) > 1 else "toggle"
+        panel_page = _safe_int(parts[2]) if len(parts) > 2 else 0
+        await query.answer("Bulk Delete Mode ON" if panel_mode == "del" else "Toggle Mode ON")
+    elif data.startswith("tag_page:"):
+        parts = data.split(":")
+        panel_mode = parts[1] if len(parts) > 1 else "toggle"
+        panel_page = _safe_int(parts[2]) if len(parts) > 2 else 0
+        await query.answer()
+    elif data.startswith("tag_purge_nonat_ask:"):
+        parts = data.split(":")
+        panel_mode = parts[1] if len(parts) > 1 else "toggle"
+        panel_page = _safe_int(parts[2]) if len(parts) > 2 else 0
+        await query.answer("Confirm clean non-@ junk?")
+        confirm_markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ Confirm Delete Non-@ Junk", callback_data=f"tag_purge_nonat_do:{panel_mode}:{panel_page}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"tag_page:{panel_mode}:{panel_page}"),
+                ]
+            ]
+        )
+        try:
+            await query.edit_message_reply_markup(reply_markup=confirm_markup)
+        except Exception:
+            pass
+        return
+    elif data.startswith("tag_purge_nonat_do:"):
+        parts = data.split(":")
+        panel_mode = parts[1] if len(parts) > 1 else "toggle"
+        panel_page = _safe_int(parts[2]) if len(parts) > 2 else 0
+        removed = await asyncio.to_thread(purge_non_at_junk_tags)
+        await query.answer(f"Deleted {len(removed)} non-@ junk entry(ies)!")
+    elif data.startswith("tag_purge_off_ask:"):
+        parts = data.split(":")
+        panel_mode = parts[1] if len(parts) > 1 else "toggle"
+        panel_page = _safe_int(parts[2]) if len(parts) > 2 else 0
+        await query.answer("Confirm delete all OFF tags?")
+        confirm_markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ Confirm Delete All OFF", callback_data=f"tag_purge_off_do:{panel_mode}:{panel_page}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"tag_page:{panel_mode}:{panel_page}"),
+                ]
+            ]
+        )
+        try:
+            await query.edit_message_reply_markup(reply_markup=confirm_markup)
+        except Exception:
+            pass
+        return
+    elif data.startswith("tag_purge_off_do:"):
+        parts = data.split(":")
+        panel_mode = parts[1] if len(parts) > 1 else "toggle"
+        panel_page = _safe_int(parts[2]) if len(parts) > 2 else 0
+        removed = await asyncio.to_thread(purge_inactive_tags)
+        await query.answer(f"Deleted {len(removed)} [OFF] tag(s)!")
+    elif data.startswith("rem_toggle"):
+        parts = data.split(":")
+        if len(parts) >= 3:
+            panel_mode = parts[1]
+            panel_page = _safe_int(parts[2])
         new_state = not is_reminders_enabled()
         await asyncio.to_thread(set_setting, "reminders_enabled", "true" if new_state else "false")
         await query.answer(f"Reminders {'ON' if new_state else 'OFF'}")
-    elif data == "tag_clear":
+    elif data.startswith("tag_clear"):
+        parts = data.split(":")
+        if len(parts) >= 3:
+            panel_mode = parts[1]
+            panel_page = _safe_int(parts[2])
         await asyncio.to_thread(clear_assistant_tags)
         await query.answer("Cleared all assistant tags")
     elif data.startswith("allfines_days:"):
@@ -3756,7 +4376,7 @@ async def tags_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     chat_id = query.message.chat.id if query.message else None
-    text, markup = await asyncio.to_thread(_build_tags_panel, chat_id)
+    text, markup = await asyncio.to_thread(_build_tags_panel, chat_id, panel_mode, panel_page)
     try:
         await query.edit_message_text(text=text, reply_markup=markup, parse_mode="HTML")
     except Exception:
@@ -4944,17 +5564,26 @@ async def removemember_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not _is_admin(update):
         await update.message.reply_text("Only the configured admin can modify the team roster.")
         return
-    if not context.args:
-        await update.message.reply_text("Usage: <code>/removemember @username</code>", parse_mode="HTML")
+    targets = _parse_bulk_tag_targets(update, context)
+    if not targets:
+        await update.message.reply_text(
+            "Usage: <code>/removemember @u1 @u2 ...</code> (ya <code>/removemember junk</code>)",
+            parse_mode="HTML",
+        )
         return
 
-    removed = []
-    for raw in context.args:
-        if await asyncio.to_thread(remove_team_member, raw):
-            removed.append(raw)
+    if len(targets) == 1 and targets[0].lower() in ("nonat", "junk", "invalid", "garbage"):
+        removed = await asyncio.to_thread(purge_non_at_junk_tags)
+    elif len(targets) == 1 and targets[0].lower() == "off":
+        removed = await asyncio.to_thread(purge_inactive_tags)
+    else:
+        removed = await asyncio.to_thread(purge_tag_entries, targets, True)
 
     if removed:
-        await update.message.reply_text(f"Removed from roster & tags: {', '.join(removed)}")
+        await update.message.reply_text(
+            f"Removed from roster & tags ({len(removed)}): {', '.join(html.escape(r) for r in removed[:30])}",
+            parse_mode="HTML",
+        )
     else:
         await update.message.reply_text("No matching member found in roster.")
 
@@ -5091,6 +5720,14 @@ async def handle_backup_document_upload(update: Update, context: ContextTypes.DE
     await tg_file.download_to_memory(out=buf)
     try:
         res = await asyncio.to_thread(restore_any_backup_bytes, buf.getvalue(), message.document.file_name or fname)
+    except ValueError as exc:
+        logger.info("Ignored non-backup spreadsheet %s: %s", fname, exc)
+        await message.reply_text(
+            f"ℹ️ <code>{html.escape(message.document.file_name or fname)}</code> bot ka backup report nahi hai — tags/reports mein add nahi kiya gaya.",
+            parse_mode="HTML",
+            reply_to_message_id=message.message_id,
+        )
+        return
     except Exception as exc:
         logger.warning("Auto backup restore failed for %s: %s", fname, exc)
         await message.reply_text(
@@ -5338,31 +5975,44 @@ async def dmstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     work_gid = get_work_group_id()
     await refresh_group_admins(context.bot, work_gid, force=True)
+    recovered, _probed = await sync_already_started_dm_users(context.bot)
     tagged = await asyncio.to_thread(get_tagged_assistants_with_ids)
     started_profiles = await asyncio.to_thread(get_dm_started_profiles)
+    started_by_key: dict[str, int] = {
+        _match_key(u): uid
+        for uid, u in started_profiles.items()
+        if u and not u.startswith("User ") and _match_key(u)
+    }
 
     seen_keys: set[str] = set()
     non_admin_assistants: list[tuple[str, Optional[int]]] = []
     for u, uid in tagged:
         if is_known_group_admin(u, uid):
             continue
-        seen_keys.add(_match_key(u))
-        non_admin_assistants.append((u, uid))
+        k = _match_key(u)
+        resolved_uid = uid if uid is not None else started_by_key.get(k)
+        seen_keys.add(k)
+        non_admin_assistants.append((u, resolved_uid))
     for uid, u in started_profiles.items():
         if DEFAULT_ADMIN_CHAT_ID is not None and uid == DEFAULT_ADMIN_CHAT_ID:
             continue
         if is_known_group_admin(u, uid):
             continue
-        if _match_key(u) not in seen_keys:
-            seen_keys.add(_match_key(u))
+        k = _match_key(u)
+        if k not in seen_keys:
+            seen_keys.add(k)
             non_admin_assistants.append((u, uid))
 
     lines = [
         "<b>Assistant DM Delivery Status (/start Only | Admins Strictly Excluded)</b>",
-        f"Active Non-Admin Assistants: <b>{len(non_admin_assistants)}</b>\n",
+        f"Active Non-Admin Assistants: <b>{len(non_admin_assistants)}</b>",
     ]
+    if recovered > 0:
+        lines.append(f"🔄 <i>Auto-recovered {recovered} previously /started assistant(s) from Telegram!</i>")
+    lines.append("")
     for uname, uid in non_admin_assistants:
-        if uid is not None and uid in started_profiles:
+        is_ready = (uid is not None and uid in started_profiles) or (_match_key(uname) in started_by_key)
+        if is_ready:
             status = "✅ Bot DM Ready (/start done)"
         else:
             status = "⏳ Needs /start (Tap 1-Tap DM button in group countdown)"
@@ -5383,6 +6033,7 @@ async def dmall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     work_gid = get_work_group_id()
     await refresh_group_admins(context.bot, work_gid, force=True)
+    await sync_already_started_dm_users(context.bot)
     started_profiles = await asyncio.to_thread(get_dm_started_profiles)
     tagged = await asyncio.to_thread(get_tagged_assistants_with_ids)
 
@@ -5624,8 +6275,17 @@ async def launch_penalty_countdown(
     )
 
     dm_btn_markup: Optional[InlineKeyboardMarkup] = None
+    await sync_already_started_dm_users(bot)
     started_ids = await asyncio.to_thread(get_dm_started_user_ids)
-    needs_start = any((uid is None or uid not in started_ids) for _u, uid in pending)
+    started_keys = {
+        _match_key(u)
+        for u in (await asyncio.to_thread(get_dm_started_profiles)).values()
+        if u and not u.startswith("User ")
+    }
+    needs_start = any(
+        (uid is None or uid not in started_ids) and _match_key(u) not in started_keys
+        for u, uid in pending
+    )
     if needs_start:
         bot_uname = await _get_bot_username(bot)
         if bot_uname:
@@ -6363,6 +7023,12 @@ async def post_init(application: Application) -> None:
     work_gids = get_all_work_group_ids()
     for wg_id in work_gids:
         await refresh_group_admins(application.bot, wg_id, force=True)
+    try:
+        recovered, probed = await sync_already_started_dm_users(application.bot)
+        if probed > 0:
+            logger.info("DM /start sync complete: recovered=%s from %s candidates", recovered, probed)
+    except Exception as exc:
+        logger.warning("DM /start startup sync skipped: %s", exc)
 
     # Scoped Telegram / command menus: Assistants see ONLY their 5 commands; Admin sees full control suite
     assistant_menu = [
@@ -6387,7 +7053,8 @@ async def post_init(application: Application) -> None:
         BotCommand("dmstatus", "Started assistants DM status dekhein"),
         BotCommand("dmall", "Sabhi started assistants ko DM bhejein"),
         BotCommand("countdown", "Slot countdown start/stop karein"),
-        BotCommand("tags", "Tagged assistants manage karein"),
+        BotCommand("tags", "Tags manage / Bulk Delete / Clean Junk karein"),
+        BotCommand("cleanjunktags", "Galti se add hue non-@ tags ek saath hatayein"),
         BotCommand("leave", "Assistant ki leave mark karein"),
         BotCommand("restore", "Backup .db/.xlsx se data recover karein"),
         BotCommand("help", "Sabhi admin commands dekhein"),
@@ -6524,7 +7191,9 @@ def main() -> None:
     application.add_handler(CommandHandler(["tags", "assistants"], tags_command))
     application.add_handler(CommandHandler("settags", settags_command))
     application.add_handler(CommandHandler(["addtag", "addassistant"], addtag_command))
-    application.add_handler(CommandHandler(["removetag", "removeassistant"], removetag_command))
+    application.add_handler(CommandHandler(["removetag", "removetags", "removeassistant", "deltag", "deltags"], removetag_command))
+    application.add_handler(CommandHandler(["cleanjunktags", "cleanjunk"], cleanjunktags_command))
+    application.add_handler(CommandHandler(["keepassistants", "keeptags"], keepassistants_command))
     application.add_handler(CommandHandler("cleartags", cleartags_command))
     application.add_handler(CallbackQueryHandler(tags_callback_handler))
     application.add_handler(CommandHandler("reminder", reminder_command))
@@ -6563,7 +7232,7 @@ def main() -> None:
     application.add_handler(CommandHandler("find", find_command))
     application.add_handler(CommandHandler(["day", "date"], day_command))
     application.add_handler(CommandHandler("addmember", addmember_command))
-    application.add_handler(CommandHandler("removemember", removemember_command))
+    application.add_handler(CommandHandler(["removemember", "removemembers"], removemember_command))
     application.add_handler(CommandHandler("team", team_command))
     application.add_handler(CommandHandler("dmstatus", dmstatus_command))
     application.add_handler(CommandHandler("dmtest", dmtest_command))
