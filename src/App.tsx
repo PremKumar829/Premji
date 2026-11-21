@@ -138,7 +138,17 @@ export default function App() {
         return match.joining ? `${match.joining} (${timeShort})` : timeShort;
       });
       const onTimeSlots = slotStates.filter(Boolean).length;
-      const totalJoining = memberRows.reduce((sum, r) => sum + (Number.parseInt(r.joining, 10) || 0), 0);
+      // Cumulative daily joining: take the latest chronological slot's valid numeric joining (e.g. 10AM=30, 1PM=45 => 45)
+      let totalJoining = 0;
+      REPORTING_SLOTS.forEach((slot) => {
+        const match = memberRows.find((r) => r.reportingSlot === slot.label);
+        if (match) {
+          const parsed = Number.parseInt(match.joining.replace(/,/g, ''), 10);
+          if (!Number.isNaN(parsed)) {
+            totalJoining = parsed;
+          }
+        }
+      });
       const compliance = Math.round((onTimeSlots / REPORTING_SLOTS.length) * 100);
       return {
         member,
@@ -1119,7 +1129,7 @@ export default function App() {
                           {s.shortLabel}
                         </th>
                       ))}
-                      <th className="px-3 py-2.5 text-right">Total Joining</th>
+                      <th className="px-3 py-2.5 text-right">Valid Joining</th>
                       <th className="px-3 py-2.5 text-right">Compliance</th>
                       <th className="px-3 py-2.5 text-right">Roster</th>
                     </tr>

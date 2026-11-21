@@ -212,14 +212,59 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
     description: 'Generates and sends the 5-sheet .xlsx workbook (Regular Late ₹5, Final Late ₹10, Missed ₹15 columns) for today or a specific date.',
   },
   {
-    command: '/weekly',
+    command: '/weekly & /monthly [YYYY-MM]',
     scope: 'Admin / Group',
-    description: 'Sends a 7-day consolidated Excel workbook with Total Joining, Penalties (₹5/₹10/₹15), and Member Compliance %.',
+    description: 'Sends 7-day or monthly consolidated Excel workbooks summing Valid Daily Joining across days (no double-counting within the same day) + penalties & balance due.',
   },
   {
-    command: '/summary & /mystatus',
+    command: '/payout [days] [rate] & /setrate <Rs>',
+    scope: 'Admin Only',
+    description: 'Generates a net payout Excel sheet: (Valid Joinings × Rate) - Unpaid/Unwaived Fines.',
+  },
+  {
+    command: '/summary, /leaderboard, /mystatus & /myfine',
     scope: 'Group / DM',
-    description: 'Shows live slot submission counts, total joining, ₹5/₹10 late + ₹15 missed penalty totals, and an interactive button to remove/restore assistant names.',
+    description: 'Shows Valid Daily Joining (latest slot value per day), Daily Target diff, Ranked Leaderboard (auto 8:45 PM), Fine Card, and interactive name manager.',
+  },
+  {
+    command: '/leave & /unleave',
+    scope: 'Admin Only',
+    description: '/leave @user [today|YYYY-MM-DD] [slot|full] — Exempts assistant from reminders and missed penalties for a slot or full day.',
+  },
+  {
+    command: '/paid @user <amt> & /waive @user <amt>',
+    scope: 'Admin Only',
+    description: 'Tracks fine payments and waivers in the ledger so Balance Due updates accurately across summaries and Excel.',
+  },
+  {
+    command: '/setshift @user morning|evening|full & /settarget <N>',
+    scope: 'Admin Only',
+    description: 'Assigns custom reporting shifts per assistant and configures a daily joining goal with + / - variance.',
+  },
+  {
+    command: '/setpenalty regular 5 final 10 missed 15',
+    scope: 'Admin Only',
+    description: 'Updates regular late, final late (>8 PM), and missed penalty rates live without editing code.',
+  },
+  {
+    command: '/holiday on|off, /offdays sun & /cleanchat on|off',
+    scope: 'Admin Only',
+    description: 'Pauses alerts on holidays/Sundays and auto-deletes stale slot reminder messages when Clean Chat Mode is ON.',
+  },
+  {
+    command: '/alias @old @new & /aliases',
+    scope: 'Admin Only',
+    description: 'Merges changed/alternate Telegram usernames into one canonical profile so reports and penalties never split.',
+  },
+  {
+    command: '/find @user [days] & /day [YYYY-MM-DD]',
+    scope: 'Group / DM',
+    description: 'Searches any assistant history across N days or pulls a full daily snapshot for any past date.',
+  },
+  {
+    command: '/addworkgroup, /removeworkgroup & /groups',
+    scope: 'Admin Only',
+    description: 'Tracks multiple work groups simultaneously alongside your central Database/Excel group.',
   },
   {
     command: '/removesummary @user | /restoresummary @user',
@@ -227,9 +272,14 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
     description: 'Removes or restores any assistant name from the Telegram Summary format & Excel Member Summary / Slot Matrix sheets.',
   },
   {
+    command: '/dmstatus & /dmtest @assistant',
+    scope: 'Admin Only',
+    description: 'Tracks which non-admin Assistants have clicked /start (or tapped the 1-tap Enable Personal DM Alerts button on countdowns) to receive personal DM reminders. Group Admins are strictly excluded.',
+  },
+  {
     command: '/restore (or /recover)',
     scope: 'Admin Only',
-    description: 'Recovers all old reports, old Work Group ID, members & tags from pinned or replied .db (reports.db) or .xlsx files in Database Group.',
+    description: 'Recovers all old reports, old Work Group ID, members & tags from pinned or replied .db (reports.db) or .xlsx files in Database Group (auto nightly backup at 9:15 PM IST).',
   },
 ];
 

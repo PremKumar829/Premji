@@ -18,6 +18,7 @@ Requires: python-telegram-bot[job-queue] >= 21.0, openpyxl >= 3.1.5, python-dote
 
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -96,7 +97,11 @@ PREVENT_DUPLICATE_SLOTS = os.getenv("PREVENT_DUPLICATE_SLOTS", "true").strip().l
 
 DB_PATH = os.getenv("DB_PATH", "reports.db").strip()
 IST = ZoneInfo("Asia/Kolkata")
-DAILY_SEND_TIME_IST = time(hour=20, minute=35, second=0, tzinfo=IST)  # 8:35 PM IST
+MORNING_KICKOFF_TIME_IST = time(hour=9, minute=45, second=0, tzinfo=IST)   # 9:45 AM IST
+DAILY_PENALTY_TIME_IST = time(hour=20, minute=30, second=0, tzinfo=IST)    # 8:30 PM IST
+DAILY_SEND_TIME_IST = time(hour=20, minute=35, second=0, tzinfo=IST)       # 8:35 PM IST
+DAILY_LEADERBOARD_TIME_IST = time(hour=20, minute=45, second=0, tzinfo=IST)  # 8:45 PM IST
+NIGHTLY_BACKUP_TIME_IST = time(hour=21, minute=15, second=0, tzinfo=IST)   # 9:15 PM IST
 COUNTDOWN_DURATION_SECS = 15 * 60
 COUNTDOWN_REFRESH_SECS = 15
 PENALTY_LATE_REGULAR_RS = 5
@@ -104,6 +109,7 @@ PENALTY_LATE_FINAL_RS = 10
 PENALTY_MISSED_RS = 15
 
 _REPORT_LOCK = asyncio.Lock()
+_BOT_USERNAME_CACHE: Optional[str] = None
 _SEEN_MEDIA_GROUPS: dict[str, datetime] = {}
 _MISMATCH_WARN_CACHE: dict[int, datetime] = {}
 _ADMIN_SYNC_CACHE: dict[int, datetime] = {}
@@ -138,6 +144,12 @@ REPORTING_SLOTS: tuple[ReportingSlot, ...] = (
     ),
 )
 FINAL_SLOT_LABEL = REPORTING_SLOTS[4].label
+SLOT_ORDER: dict[str, int] = {slot.label: idx for idx, slot in enumerate(REPORTING_SLOTS)}
+SHIFT_SLOTS: dict[str, set[str]] = {
+    "full": {s.label for s in REPORTING_SLOTS},
+    "morning": {REPORTING_SLOTS[0].label, REPORTING_SLOTS[1].label, REPORTING_SLOTS[2].label},
+    "evening": {REPORTING_SLOTS[2].label, REPORTING_SLOTS[3].label, REPORTING_SLOTS[4].label},
+}
 
 
 def detect_active_slot(ist_dt: datetime) -> Optional[str]:
@@ -160,7 +172,7 @@ def parse_slot_alias(raw: str) -> Optional[str]:
         return REPORTING_SLOTS[2].label
     if token in ("5", "5pm", "17", "1700", "slot4", "4th", "evening"):
         return REPORTING_SLOTS[3].label
-    if token in ("8", "8pm", "20", "1930", "final", "slot5", "5th", "night"):
+    if token in ("8", "8pm", "20", "1930", "1915", "715", "final", "slot5", "5th", "night"):
         return REPORTING_SLOTS[4].label
     for slot in REPORTING_SLOTS:
         if token in slot.label.lower().replace(" ", ""):
@@ -209,14 +221,64 @@ def _is_final_slot(slot_label: str) -> bool:
     return slot_label == FINAL_SLOT_LABEL
 
 
+def get_penalty_config() -> tuple[int, int, int]:
+    """Return (regular_late_rs, final_late_rs, missed_rs) from bot_settings with defaults 5, 10, 15."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = dict(
+                conn.execute(
+                    "SELECT key, value FROM bot_settings WHERE key IN ('penalty_late_regular', 'penalty_late_final', 'penalty_missed')"
+                ).fetchall()
+            )
+        reg = int(rows.get("penalty_late_regular", PENALTY_LATE_REGULAR_RS))
+        fin = int(rows.get("penalty_late_final", PENALTY_LATE_FINAL_RS))
+        mis = int(rows.get("penalty_missed", PENALTY_MISSED_RS))
+        return max(0, reg), max(0, fin), max(0, mis)
+    except Exception:
+        return PENALTY_LATE_REGULAR_RS, PENALTY_LATE_FINAL_RS, PENALTY_MISSED_RS
+
+
 def _late_penalty_for_slot(slot_label: str) -> int:
-    return PENALTY_LATE_FINAL_RS if _is_final_slot(slot_label) else PENALTY_LATE_REGULAR_RS
+    reg, fin, _ = get_penalty_config()
+    return fin if _is_final_slot(slot_label) else reg
+
+
+def get_missed_penalty_rs() -> int:
+    return get_penalty_config()[2]
+
+
+def is_date_holiday_or_off(target_date: str) -> tuple[bool, str]:
+    """Return (True, reason) if holiday_mode is ON or target_date falls on configured off-days (e.g. sun)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = dict(
+                conn.execute(
+                    "SELECT key, value FROM bot_settings WHERE key IN ('holiday_mode', 'off_days')"
+                ).fetchall()
+            )
+    except Exception:
+        return False, ""
+    if str(rows.get("holiday_mode", "false")).lower() == "true":
+        return True, "Holiday Mode ON"
+    off_raw = str(rows.get("off_days", "")).strip().lower()
+    if off_raw and off_raw != "none":
+        off_tokens = {t.strip()[:3] for t in off_raw.split(",") if t.strip()}
+        try:
+            wk = datetime.strptime(target_date, "%Y-%m-%d").strftime("%a").lower()[:3]
+            if wk in off_tokens:
+                return True, f"Weekly Off ({wk.upper()})"
+        except ValueError:
+            pass
+    return False, ""
 
 
 def get_closed_slots_for_date(
     target_date: str, now_ist: Optional[datetime] = None
 ) -> list[ReportingSlot]:
-    """Return slots whose On-Time deadline has already closed on target_date."""
+    """Return slots whose On-Time deadline has already closed on target_date (empty on Holidays/Off-days)."""
+    is_off, _reason = is_date_holiday_or_off(target_date)
+    if is_off:
+        return []
     ref = now_ist or datetime.now(IST)
     today_str = ref.strftime("%Y-%m-%d")
     if target_date < today_str:
@@ -301,15 +363,19 @@ def resolve_submission_slot_and_penalty(ist_dt: datetime) -> tuple[Optional[str]
 
 
 def recalculate_report_statuses(conn: sqlite3.Connection) -> int:
-    """Auto-sync status and ₹5/₹10 late penalty on existing/restored rows based on submission_time."""
+    """Auto-sync status and late penalty on existing/restored rows (preserving admin-waived rows)."""
     fixed = 0
     cols = {row[1] for row in conn.execute("PRAGMA table_info(reports)").fetchall()}
     has_pen = "penalty_rs" in cols
+    has_waived = "waived_on_time" in cols
     sel_pen = "COALESCE(penalty_rs, 0)" if has_pen else "0"
+    sel_waived = "COALESCE(waived_on_time, 0)" if has_waived else "0"
     rows = conn.execute(
-        f"SELECT id, submission_time, reporting_slot, status, {sel_pen} FROM reports"
+        f"SELECT id, submission_time, reporting_slot, status, {sel_pen}, {sel_waived} FROM reports"
     ).fetchall()
-    for row_id, sub_time, slot_label, status, cur_pen in rows:
+    for row_id, sub_time, slot_label, status, cur_pen, is_waived in rows:
+        if int(is_waived or 0) == 1:
+            continue
         expected_status, expected_pen = evaluate_slot_status_from_strings_with_penalty(
             str(sub_time or ""), str(slot_label or "")
         )
@@ -326,6 +392,47 @@ def recalculate_report_statuses(conn: sqlite3.Connection) -> int:
                 )
             fixed += 1
     return fixed
+
+
+def _safe_int_joining(val: str) -> Optional[int]:
+    cleaned = str(val or "").replace(",", "").strip()
+    if not cleaned:
+        return None
+    try:
+        return int(cleaned)
+    except ValueError:
+        return None
+
+
+def compute_daily_joining_from_rows(
+    day_rows: list[tuple[str, str, str, str, str, str, int, str]]
+) -> int:
+    """
+    Joining within a single day is cumulative (e.g. 10 AM = 30, 1 PM = 45 -> today's valid joining is 45, NOT 75).
+    Returns the latest chronological slot's valid numeric joining value for that day.
+    """
+    best_rank = (-1, -1)
+    best_val = 0
+    for idx, r in enumerate(day_rows):
+        parsed = _safe_int_joining(r[1])
+        if parsed is None:
+            continue
+        slot_rank = SLOT_ORDER.get(str(r[3]), 99)
+        rank = (slot_rank, idx)
+        if rank >= best_rank:
+            best_rank = rank
+            best_val = parsed
+    return best_val
+
+
+def compute_period_joining_from_rows(
+    member_rows: list[tuple[str, str, str, str, str, str, int, str]]
+) -> int:
+    """Sum valid cumulative daily joining across distinct report_date values."""
+    by_date: dict[str, list[tuple[str, str, str, str, str, str, int, str]]] = {}
+    for r in member_rows:
+        by_date.setdefault(str(r[4]), []).append(r)
+    return sum(compute_daily_joining_from_rows(d_rows) for d_rows in by_date.values())
 
 
 _USERNAME_PATTERN = re.compile(
@@ -452,6 +559,79 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS leaves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username_key TEXT NOT NULL,
+                username TEXT NOT NULL,
+                leave_date TEXT NOT NULL,
+                slot_label TEXT NOT NULL DEFAULT '',
+                reason TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(username_key, leave_date, slot_label)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS penalty_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username_key TEXT NOT NULL,
+                username TEXT NOT NULL,
+                entry_type TEXT NOT NULL,
+                amount_rs INTEGER NOT NULL,
+                note TEXT DEFAULT '',
+                entry_date TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS username_aliases (
+                alias_key TEXT PRIMARY KEY,
+                alias_display TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                target_display TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_shifts (
+                username_key TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                shift_name TEXT NOT NULL DEFAULT 'full',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS report_photos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_unique_id TEXT NOT NULL,
+                username_key TEXT NOT NULL,
+                username TEXT NOT NULL,
+                report_date TEXT NOT NULL,
+                reporting_slot TEXT NOT NULL,
+                message_id INTEGER,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracked_chats (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT DEFAULT '',
+                role TEXT NOT NULL DEFAULT 'work',
+                added_at TEXT NOT NULL
+            )
+            """
+        )
 
         # Lightweight schema migrations
         tag_cols = {
@@ -479,15 +659,30 @@ def init_db() -> None:
             conn.execute("ALTER TABLE reports ADD COLUMN penalty_rs INTEGER NOT NULL DEFAULT 0")
         if "caption" not in report_cols:
             conn.execute("ALTER TABLE reports ADD COLUMN caption TEXT DEFAULT ''")
+        if "waived_on_time" not in report_cols:
+            conn.execute("ALTER TABLE reports ADD COLUMN waived_on_time INTEGER NOT NULL DEFAULT 0")
+        if "chat_id" not in report_cols:
+            conn.execute("ALTER TABLE reports ADD COLUMN chat_id INTEGER")
+        if "source_message_id" not in report_cols:
+            conn.execute("ALTER TABLE reports ADD COLUMN source_message_id INTEGER")
 
         conn.execute(
             "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
             ("reminders_enabled", "true" if DEFAULT_ENABLE_REMINDERS else "false"),
         )
+        conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('clean_chat_mode', 'true')")
+        conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('holiday_mode', 'false')")
+        conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('off_days', '')")
+        conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('daily_joining_target', '0')")
+        conn.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES ('per_joining_rate', '0')")
         if DEFAULT_WORK_CHAT_ID is not None:
             conn.execute(
                 "INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)",
                 ("work_group_id", str(DEFAULT_WORK_CHAT_ID)),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO tracked_chats (chat_id, title, role, added_at) VALUES (?, 'Primary Work Group', 'work', ?)",
+                (DEFAULT_WORK_CHAT_ID, datetime.now(IST).isoformat()),
             )
         if DEFAULT_EXCEL_GROUP_ID is not None:
             conn.execute(
@@ -531,21 +726,38 @@ def _pick_canonical_username(names: list[str]) -> str:
 
 def deduplicate_case_insensitive_records(conn: sqlite3.Connection) -> int:
     """
-    Merge case-variant duplicates across team_members, assistant_tags, summary_excluded, and reports
+    Merge case-variant and alias duplicates across team_members, assistant_tags, summary_excluded, and reports
     (e.g. @PREMGUPTA2M + @Premgupta2m -> single canonical row) so assistants are never marked Missed twice.
     """
     removed = 0
+    alias_rows: dict[str, tuple[str, str]] = {}
+    has_alias_tbl = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='username_aliases'"
+    ).fetchone()
+    if has_alias_tbl:
+        for ak, tk, td in conn.execute(
+            "SELECT alias_key, target_key, target_display FROM username_aliases"
+        ).fetchall():
+            alias_rows[str(ak)] = (str(tk), str(td))
+
+    def _canon_key(raw: str) -> str:
+        k = (raw or "").strip().lstrip("@").lower()
+        return alias_rows[k][0] if k in alias_rows else k
 
     # 1. Deduplicate team_members
     tm_rows = conn.execute("SELECT rowid, username, user_id, added_at FROM team_members").fetchall()
     tm_groups: dict[str, list[tuple[int, str, Optional[int], str]]] = {}
     for rowid, uname, uid, added_at in tm_rows:
-        k = (uname or "").strip().lstrip("@").lower()
+        k = _canon_key(uname or "")
         if k:
             tm_groups.setdefault(k, []).append((rowid, uname, uid, added_at))
     for k, grp in tm_groups.items():
         if len(grp) > 1 or any(g[1] != grp[0][1] for g in grp):
             canon = _pick_canonical_username([g[1] for g in grp])
+            for ak, (tk, td) in alias_rows.items():
+                if tk == k and td:
+                    canon = td
+                    break
             best_uid = next((g[2] for g in grp if g[2] is not None), None)
             best_added = min(str(g[3] or "") for g in grp)
             keep_id = grp[0][0]
@@ -561,12 +773,16 @@ def deduplicate_case_insensitive_records(conn: sqlite3.Connection) -> int:
     at_rows = conn.execute("SELECT rowid, username, user_id, is_active, added_at FROM assistant_tags").fetchall()
     at_groups: dict[str, list[tuple[int, str, Optional[int], int, str]]] = {}
     for rowid, uname, uid, is_act, added_at in at_rows:
-        k = (uname or "").strip().lstrip("@").lower()
+        k = _canon_key(uname or "")
         if k:
             at_groups.setdefault(k, []).append((rowid, uname, uid, int(is_act or 0), added_at))
     for k, grp in at_groups.items():
         if len(grp) > 1:
             canon = _pick_canonical_username([g[1] for g in grp])
+            for ak, (tk, td) in alias_rows.items():
+                if tk == k and td:
+                    canon = td
+                    break
             best_uid = next((g[2] for g in grp if g[2] is not None), None)
             best_act = 1 if any(g[3] == 1 for g in grp) else 0
             best_added = min(str(g[4] or "") for g in grp)
@@ -583,7 +799,7 @@ def deduplicate_case_insensitive_records(conn: sqlite3.Connection) -> int:
     se_rows = conn.execute("SELECT rowid, username FROM summary_excluded").fetchall()
     seen_se: set[str] = set()
     for rowid, uname in se_rows:
-        k = (uname or "").strip().lstrip("@").lower()
+        k = _canon_key(uname or "")
         if k in seen_se:
             conn.execute("DELETE FROM summary_excluded WHERE rowid = ?", (rowid,))
             removed += 1
@@ -592,9 +808,12 @@ def deduplicate_case_insensitive_records(conn: sqlite3.Connection) -> int:
 
     # 4. Canonicalize and deduplicate reports on (key, report_date, reporting_slot)
     canon_map: dict[str, str] = {}
+    for ak, (tk, td) in alias_rows.items():
+        if td:
+            canon_map[tk] = td
     for (uname,) in conn.execute("SELECT username FROM team_members").fetchall():
         k = (uname or "").strip().lstrip("@").lower()
-        if k:
+        if k and k not in canon_map:
             canon_map[k] = uname
     for (uname,) in conn.execute("SELECT username FROM assistant_tags").fetchall():
         k = (uname or "").strip().lstrip("@").lower()
@@ -606,7 +825,7 @@ def deduplicate_case_insensitive_records(conn: sqlite3.Connection) -> int:
     ).fetchall()
     rep_groups: dict[tuple[str, str, str], list[tuple[int, str, str, Optional[int]]]] = {}
     for rid, uname, joining, uid, rdate, rslot in rep_rows:
-        k = (uname or "").strip().lstrip("@").lower()
+        k = _canon_key(uname or "")
         if not k:
             continue
         rep_groups.setdefault((k, str(rdate), str(rslot)), []).append((rid, uname, joining, uid))
@@ -653,9 +872,82 @@ def is_reminders_enabled() -> bool:
     return (val or "true").lower() == "true"
 
 
+def is_clean_chat_enabled() -> bool:
+    return (get_setting("clean_chat_mode", "true") or "true").lower() == "true"
+
+
+def get_daily_joining_target() -> int:
+    return _safe_int(get_setting("daily_joining_target", "0") or "0")
+
+
+def get_per_joining_rate() -> int:
+    return _safe_int(get_setting("per_joining_rate", "0") or "0")
+
+
 def get_work_group_id() -> Optional[int]:
     val = get_setting("work_group_id")
     return int(val) if val else DEFAULT_WORK_CHAT_ID
+
+
+def get_all_work_group_ids() -> list[int]:
+    ids: list[int] = []
+    primary = get_work_group_id()
+    if primary is not None:
+        ids.append(primary)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            for (cid,) in conn.execute(
+                "SELECT chat_id FROM tracked_chats WHERE role = 'work' ORDER BY chat_id ASC"
+            ).fetchall():
+                if int(cid) not in ids:
+                    ids.append(int(cid))
+    except Exception:
+        pass
+    return ids
+
+
+def is_allowed_work_group(chat_id: int) -> bool:
+    allowed = get_all_work_group_ids()
+    if not allowed:
+        return True
+    return chat_id in allowed
+
+
+def add_work_group(chat_id: int, title: str = "") -> None:
+    now_iso = datetime.now(IST).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO tracked_chats (chat_id, title, role, added_at) VALUES (?, ?, 'work', ?)
+            ON CONFLICT(chat_id) DO UPDATE SET title = COALESCE(NULLIF(excluded.title, ''), tracked_chats.title), role = 'work'
+            """,
+            (chat_id, title or f"Group {chat_id}", now_iso),
+        )
+        if not get_setting("work_group_id"):
+            conn.execute(
+                "INSERT INTO bot_settings (key, value) VALUES ('work_group_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(chat_id),),
+            )
+        conn.commit()
+
+
+def remove_work_group(chat_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("DELETE FROM tracked_chats WHERE chat_id = ? AND role = 'work'", (chat_id,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_tracked_work_groups() -> list[tuple[int, str]]:
+    primary = get_work_group_id()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT chat_id, COALESCE(title, '') FROM tracked_chats WHERE role = 'work' ORDER BY added_at ASC"
+        ).fetchall()
+    out: dict[int, str] = {int(cid): (ttl or f"Group {cid}") for cid, ttl in rows}
+    if primary is not None and primary not in out:
+        out[primary] = "Primary Work Group"
+    return list(out.items())
 
 
 def get_excel_group_id() -> Optional[int]:
@@ -692,6 +984,17 @@ def _resolve_canonical_name(conn: sqlite3.Connection, raw_username: str) -> str:
     key = _match_key(clean)
     if not key:
         return ""
+    has_alias = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='username_aliases'"
+    ).fetchone()
+    if has_alias:
+        al = conn.execute(
+            "SELECT target_key, target_display FROM username_aliases WHERE alias_key = ? LIMIT 1",
+            (key,),
+        ).fetchone()
+        if al and al[0]:
+            key = str(al[0])
+            clean = str(al[1] or clean)
     for table in ("team_members", "assistant_tags", "reports"):
         row = conn.execute(
             f"SELECT username FROM {table} WHERE LOWER(LTRIM(username, '@')) = ? LIMIT 1",
@@ -700,6 +1003,284 @@ def _resolve_canonical_name(conn: sqlite3.Connection, raw_username: str) -> str:
         if row and row[0]:
             return str(row[0]).strip()
     return _normalize_tag(clean) if clean.startswith("@") else clean
+
+
+def add_username_alias(old_username: str, new_username: str) -> tuple[str, str, int]:
+    old_disp = _normalize_tag(old_username) or old_username.strip()
+    new_disp = _normalize_tag(new_username) or new_username.strip()
+    old_key = _match_key(old_disp)
+    new_key = _match_key(new_disp)
+    now_iso = datetime.now(IST).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO username_aliases (alias_key, alias_display, target_key, target_display, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(alias_key) DO UPDATE SET
+                alias_display = excluded.alias_display,
+                target_key = excluded.target_key,
+                target_display = excluded.target_display
+            """,
+            (old_key, old_disp, new_key, new_disp, now_iso),
+        )
+        conn.execute("UPDATE leaves SET username_key = ?, username = ? WHERE username_key = ?", (new_key, new_disp, old_key))
+        conn.execute("UPDATE penalty_ledger SET username_key = ?, username = ? WHERE username_key = ?", (new_key, new_disp, old_key))
+        conn.execute("UPDATE assistant_shifts SET username_key = ?, username = ? WHERE username_key = ?", (new_key, new_disp, old_key))
+        merged = deduplicate_case_insensitive_records(conn)
+        conn.commit()
+    return old_disp, new_disp, merged
+
+
+def get_username_aliases() -> list[tuple[str, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT alias_display, target_display FROM username_aliases ORDER BY alias_display ASC"
+        ).fetchall()
+
+
+def add_leave(username: str, leave_date: str, slot_label: str = "", reason: str = "") -> str:
+    now_iso = datetime.now(IST).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        canon = _resolve_canonical_name(conn, username) or _normalize_tag(username) or username.strip()
+        key = _match_key(canon)
+        conn.execute(
+            """
+            INSERT INTO leaves (username_key, username, leave_date, slot_label, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(username_key, leave_date, slot_label) DO UPDATE SET
+                username = excluded.username,
+                reason = excluded.reason
+            """,
+            (key, canon, leave_date, slot_label, reason, now_iso),
+        )
+        conn.commit()
+    return canon
+
+
+def remove_leave(username: str, leave_date: str, slot_label: str = "") -> int:
+    key = _match_key(username)
+    with sqlite3.connect(DB_PATH) as conn:
+        if slot_label:
+            cur = conn.execute(
+                "DELETE FROM leaves WHERE username_key = ? AND leave_date = ? AND slot_label = ?",
+                (key, leave_date, slot_label),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM leaves WHERE username_key = ? AND leave_date = ?",
+                (key, leave_date),
+            )
+        conn.commit()
+        return cur.rowcount
+
+
+def get_leaves_for_date(leave_date: str) -> dict[str, set[str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT username_key, slot_label FROM leaves WHERE leave_date = ?",
+            (leave_date,),
+        ).fetchall()
+    out: dict[str, set[str]] = {}
+    for k, sl in rows:
+        out.setdefault(str(k), set()).add(str(sl or ""))
+    return out
+
+
+def is_on_leave(username: str, leave_date: str, slot_label: str = "") -> bool:
+    key = _match_key(username)
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT slot_label FROM leaves WHERE username_key = ? AND leave_date = ?",
+            (key, leave_date),
+        ).fetchall()
+    slots = {str(r[0] or "") for r in rows}
+    if "" in slots:
+        return True
+    return bool(slot_label and slot_label in slots)
+
+
+def set_assistant_shift(username: str, shift_name: str) -> str:
+    norm_shift = shift_name.strip().lower()
+    if norm_shift not in SHIFT_SLOTS:
+        norm_shift = "full"
+    now_iso = datetime.now(IST).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        canon = _resolve_canonical_name(conn, username) or _normalize_tag(username) or username.strip()
+        key = _match_key(canon)
+        conn.execute(
+            """
+            INSERT INTO assistant_shifts (username_key, username, shift_name, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(username_key) DO UPDATE SET
+                username = excluded.username,
+                shift_name = excluded.shift_name,
+                updated_at = excluded.updated_at
+            """,
+            (key, canon, norm_shift, now_iso),
+        )
+        conn.commit()
+    return canon
+
+
+def get_assistant_shifts() -> dict[str, str]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT username_key, shift_name FROM assistant_shifts").fetchall()
+    return {str(k): str(s) for k, s in rows}
+
+
+def get_slots_for_member(username: str, shifts_map: Optional[dict[str, str]] = None) -> set[str]:
+    m_key = _match_key(username)
+    if shifts_map is None:
+        shifts_map = get_assistant_shifts()
+    shift_name = shifts_map.get(m_key, "full")
+    return SHIFT_SLOTS.get(shift_name, SHIFT_SLOTS["full"])
+
+
+def add_penalty_ledger_entry(
+    username: str, entry_type: str, amount_rs: int, note: str = "", entry_date: Optional[str] = None
+) -> str:
+    now_ist = datetime.now(IST)
+    d_str = entry_date or now_ist.strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        canon = _resolve_canonical_name(conn, username) or _normalize_tag(username) or username.strip()
+        key = _match_key(canon)
+        conn.execute(
+            """
+            INSERT INTO penalty_ledger (username_key, username, entry_type, amount_rs, note, entry_date, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (key, canon, entry_type, max(0, int(amount_rs)), note, d_str, now_ist.isoformat()),
+        )
+        conn.commit()
+    return canon
+
+
+def get_penalty_ledger_summary(
+    start_date: Optional[str] = None, end_date: Optional[str] = None
+) -> dict[str, tuple[int, int]]:
+    """Return {username_key: (paid_rs, waived_rs)} for the given date filter."""
+    query = "SELECT username_key, entry_type, SUM(amount_rs) FROM penalty_ledger WHERE 1=1"
+    params: list[str] = []
+    if start_date:
+        query += " AND entry_date >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND entry_date <= ?"
+        params.append(end_date)
+    query += " GROUP BY username_key, entry_type"
+    out: dict[str, list[int]] = {}
+    with sqlite3.connect(DB_PATH) as conn:
+        for uk, etype, total in conn.execute(query, params).fetchall():
+            bucket = out.setdefault(str(uk), [0, 0])
+            if etype == "paid":
+                bucket[0] += int(total or 0)
+            elif etype == "waive":
+                bucket[1] += int(total or 0)
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
+def get_member_ledger_entries(username: str, limit: int = 10) -> list[tuple[str, int, str, str]]:
+    key = _match_key(username)
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT entry_type, amount_rs, COALESCE(note, ''), entry_date
+            FROM penalty_ledger WHERE username_key = ?
+            ORDER BY id DESC LIMIT ?
+            """,
+            (key, limit),
+        ).fetchall()
+    return [(str(t), int(a or 0), str(n), str(d)) for t, a, n, d in rows]
+
+
+def check_and_record_photo(
+    file_unique_id: str, username: str, report_date: str, reporting_slot: str, message_id: Optional[int]
+) -> Optional[tuple[str, str, str]]:
+    """
+    If file_unique_id was previously uploaded on a DIFFERENT message_id, return (prev_user, prev_date, prev_slot).
+    Otherwise record it and return None.
+    """
+    if not file_unique_id:
+        return None
+    now_iso = datetime.now(IST).isoformat()
+    key = _match_key(username)
+    with sqlite3.connect(DB_PATH) as conn:
+        prev = conn.execute(
+            """
+            SELECT username, report_date, reporting_slot, message_id
+            FROM report_photos WHERE file_unique_id = ? ORDER BY id ASC LIMIT 1
+            """,
+            (file_unique_id,),
+        ).fetchone()
+        if prev:
+            prev_uid_msg = prev[3]
+            if message_id is not None and prev_uid_msg is not None and int(prev_uid_msg) == int(message_id):
+                return None
+            return str(prev[0]), str(prev[1]), str(prev[2])
+        conn.execute(
+            """
+            INSERT INTO report_photos (file_unique_id, username_key, username, report_date, reporting_slot, message_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (file_unique_id, key, username, report_date, reporting_slot, message_id, now_iso),
+        )
+        conn.commit()
+    return None
+
+
+def get_previous_slot_joining_today(
+    username: str, report_date: str, current_slot_label: str
+) -> Optional[tuple[str, int]]:
+    """Return (prev_slot_label, prev_joining) for an earlier slot submitted today by username."""
+    key = _match_key(username)
+    cur_rank = SLOT_ORDER.get(current_slot_label, 99)
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT reporting_slot, COALESCE(joining, '')
+            FROM reports WHERE LOWER(LTRIM(username, '@')) = ? AND report_date = ?
+            """,
+            (key, report_date),
+        ).fetchall()
+    candidates: list[tuple[int, str, int]] = []
+    for sl, j_raw in rows:
+        rank = SLOT_ORDER.get(str(sl), 99)
+        parsed = _safe_int_joining(j_raw)
+        if rank < cur_rank and parsed is not None:
+            candidates.append((rank, str(sl), parsed))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1], candidates[0][2]
+
+
+def mark_report_waived_on_time(report_id: int) -> Optional[tuple[str, str, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT username, reporting_slot, report_date FROM reports WHERE id = ?",
+            (report_id,),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE reports SET status = 'On Time (Admin OK)', penalty_rs = 0, waived_on_time = 1 WHERE id = ?",
+            (report_id,),
+        )
+        conn.commit()
+        return str(row[0]), str(row[1]), str(row[2])
+
+
+def delete_report_by_id(report_id: int) -> Optional[tuple[str, str, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT username, reporting_slot, report_date FROM reports WHERE id = ?",
+            (report_id,),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+        conn.commit()
+        return str(row[0]), str(row[1]), str(row[2])
 
 
 def exclude_from_summary(username: str) -> Optional[str]:
@@ -1052,9 +1633,14 @@ def has_slot_submission(
 def get_pending_tagged_assistants_for_slot(
     report_date: str, slot_label: str
 ) -> list[tuple[str, Optional[int]]]:
+    is_off, _ = is_date_holiday_or_off(report_date)
+    if is_off:
+        return []
     tagged = get_tagged_assistants_with_ids()
     if not tagged:
         return []
+    leaves_map = get_leaves_for_date(report_date)
+    shifts_map = get_assistant_shifts()
     with sqlite3.connect(DB_PATH) as conn:
         submitted_rows = conn.execute(
             """
@@ -1065,11 +1651,34 @@ def get_pending_tagged_assistants_for_slot(
         ).fetchall()
     submitted_keys = {str(r[0]) for r in submitted_rows if r[0]}
     submitted_ids = {int(r[1]) for r in submitted_rows if r[1] is not None}
-    return [
-        (u, uid)
-        for u, uid in tagged
-        if _match_key(u) not in submitted_keys and (uid is None or uid not in submitted_ids)
-    ]
+    pending: list[tuple[str, Optional[int]]] = []
+    for u, uid in tagged:
+        ukey = _match_key(u)
+        if ukey in submitted_keys or (uid is not None and uid in submitted_ids):
+            continue
+        user_leaves = leaves_map.get(ukey, set())
+        if "" in user_leaves or slot_label in user_leaves:
+            continue
+        if slot_label not in get_slots_for_member(u, shifts_map):
+            continue
+        pending.append((u, uid))
+    return pending
+
+
+def get_report_row_id(username: str, report_date: str, reporting_slot: str) -> Optional[int]:
+    key = _match_key(username)
+    with sqlite3.connect(DB_PATH) as conn:
+        canon = _resolve_canonical_name(conn, username) or username
+        ckey = _match_key(canon)
+        row = conn.execute(
+            """
+            SELECT id FROM reports
+            WHERE LOWER(LTRIM(username, '@')) IN (?, ?) AND report_date = ? AND reporting_slot = ?
+            LIMIT 1
+            """,
+            (key, ckey, report_date, reporting_slot),
+        ).fetchone()
+        return int(row[0]) if row else None
 
 
 def upsert_report_to_db(
@@ -1084,13 +1693,15 @@ def upsert_report_to_db(
     created_at_utc: str,
     overwrite_existing: bool = True,
     penalty_rs: int = 0,
+    chat_id: Optional[int] = None,
+    source_message_id: Optional[int] = None,
 ) -> str:
-    key = _match_key(username)
     with sqlite3.connect(DB_PATH) as conn:
         canonical = _resolve_canonical_name(conn, username) or username
+        key = _match_key(canonical)
         existing = conn.execute(
             """
-            SELECT id, COALESCE(joining, ''), COALESCE(caption, '') FROM reports
+            SELECT id, COALESCE(joining, ''), COALESCE(caption, ''), COALESCE(waived_on_time, 0) FROM reports
             WHERE LOWER(LTRIM(username, '@')) = ? AND report_date = ? AND reporting_slot = ?
             LIMIT 1
             """,
@@ -1102,6 +1713,9 @@ def upsert_report_to_db(
             if overwrite_existing:
                 new_joining = joining if joining != "" else existing[1]
                 new_caption = caption if caption else existing[2]
+                is_waived = int(existing[3] or 0) == 1
+                final_status = "On Time (Admin OK)" if is_waived else status
+                final_pen = 0 if is_waived else penalty_rs
                 conn.execute(
                     """
                     UPDATE reports
@@ -1111,10 +1725,23 @@ def upsert_report_to_db(
                         submission_time = ?,
                         status = ?,
                         penalty_rs = ?,
-                        caption = ?
+                        caption = ?,
+                        chat_id = COALESCE(?, chat_id),
+                        source_message_id = COALESCE(?, source_message_id)
                     WHERE id = ?
                     """,
-                    (user_id, canonical, new_joining, submission_time, status, penalty_rs, new_caption, row_id),
+                    (
+                        user_id,
+                        canonical,
+                        new_joining,
+                        submission_time,
+                        final_status,
+                        final_pen,
+                        new_caption,
+                        chat_id,
+                        source_message_id,
+                        row_id,
+                    ),
                 )
                 conn.commit()
                 action = "updated"
@@ -1124,8 +1751,8 @@ def upsert_report_to_db(
             conn.execute(
                 """
                 INSERT INTO reports (
-                    user_id, username, joining, submission_time, reporting_slot, report_date, status, penalty_rs, caption, created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_id, username, joining, submission_time, reporting_slot, report_date, status, penalty_rs, caption, created_at_utc, chat_id, source_message_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -1138,6 +1765,8 @@ def upsert_report_to_db(
                     penalty_rs,
                     caption,
                     created_at_utc,
+                    chat_id,
+                    source_message_id,
                 ),
             )
             conn.commit()
@@ -1281,21 +1910,149 @@ def _dedup_case_insensitive(items: list[str]) -> list[str]:
     return sorted(seen.values(), key=lambda x: x.lower())
 
 
-def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple[BytesIO, int]:
+def _dates_for_period(start_date: str, end_date: str) -> list[str]:
+    cur = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end_d = datetime.strptime(end_date, "%Y-%m-%d").date()
+    out: list[str] = []
+    while cur <= end_d:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return out
+
+
+def compute_member_stats_for_period(
+    members: list[str],
+    period_rows: list[tuple[str, str, str, str, str, str, int, str]],
+    date_list: list[str],
+    now_ist: Optional[datetime] = None,
+) -> list[dict[str, object]]:
+    """
+    Compute accurate member metrics across date_list:
+      - Uses cumulative daily joining (latest slot value per day, NOT sum of slots!)
+      - Respects dynamic penalty rates, leaves, holidays/off-days, and assistant shifts
+      - Includes Paid & Waived ledger adjustments to compute Balance Due
+    """
+    ref = now_ist or datetime.now(IST)
+    reg_pen, fin_pen, missed_pen_rate = get_penalty_config()
+    shifts_map = get_assistant_shifts()
+    target_val = get_daily_joining_target()
+    leaves_by_date = {d: get_leaves_for_date(d) for d in date_list}
+    ledger_map = get_penalty_ledger_summary(
+        start_date=date_list[0] if date_list else None,
+        end_date=date_list[-1] if date_list else None,
+    )
+
+    stats: list[dict[str, object]] = []
+    for member in members:
+        m_key = _match_key(member)
+        member_rows = [r for r in period_rows if _match_key(r[0]) == m_key]
+        allowed_slots = get_slots_for_member(member, shifts_map)
+        shift_name = shifts_map.get(m_key, "full")
+
+        on_time = sum(1 for r in member_rows if r[5].startswith("On Time"))
+        late_reg = sum(
+            1
+            for r in member_rows
+            if r[6] > 0 and not _is_final_slot(r[3])
+        )
+        late_fin = sum(
+            1
+            for r in member_rows
+            if r[6] > 0 and _is_final_slot(r[3])
+        )
+        other_late = sum(1 for r in member_rows if not r[5].startswith("On Time") and r[6] == 0)
+        late_pen = sum(r[6] for r in member_rows)
+        total_joining = compute_period_joining_from_rows(member_rows)
+
+        missed = 0
+        expected_slots = 0
+        leave_days = 0
+        for d_str in date_list:
+            d_closed = get_closed_slots_for_date(d_str, ref)
+            d_leaves = leaves_by_date.get(d_str, {}).get(m_key, set())
+            if "" in d_leaves:
+                leave_days += 1
+                continue
+            d_submitted = {r[3] for r in member_rows if r[4] == d_str}
+            for s in d_closed:
+                if s.label not in allowed_slots or s.label in d_leaves:
+                    continue
+                expected_slots += 1
+                if s.label not in d_submitted:
+                    missed += 1
+
+        missed_pen = missed * missed_pen_rate
+        gross_pen = late_pen + missed_pen
+        paid_rs, waived_rs = ledger_map.get(m_key, (0, 0))
+        balance_due = max(0, gross_pen - paid_rs - waived_rs)
+        compliance = round((on_time / expected_slots) * 100) if expected_slots else 100
+        target_diff = (total_joining - (target_val * max(1, len(date_list) - leave_days))) if target_val > 0 else 0
+
+        stats.append(
+            {
+                "member": member,
+                "key": m_key,
+                "shift": shift_name,
+                "allowed_slots": allowed_slots,
+                "submitted_count": len(member_rows),
+                "expected_slots": expected_slots,
+                "on_time": on_time,
+                "late_regular": late_reg,
+                "late_final": late_fin + other_late,
+                "missed": missed,
+                "late_pen": late_pen,
+                "missed_pen": missed_pen,
+                "gross_pen": gross_pen,
+                "paid_rs": paid_rs,
+                "waived_rs": waived_rs,
+                "balance_due": balance_due,
+                "total_joining": total_joining,
+                "compliance": compliance,
+                "leave_days": leave_days,
+                "target_diff": target_diff,
+                "reg_pen_rate": reg_pen,
+                "fin_pen_rate": fin_pen,
+                "missed_pen_rate": missed_pen_rate,
+            }
+        )
+    return stats
+
+
+def build_excel_bytes(
+    target_date: Optional[str] = None,
+    days: int = 1,
+    month_str: Optional[str] = None,
+) -> tuple[BytesIO, int]:
     now_ist = datetime.now(IST)
     today_str = target_date or now_ist.strftime("%Y-%m-%d")
     closed_today_slots = get_closed_slots_for_date(today_str, now_ist)
     closed_today_labels = {s.label for s in closed_today_slots}
-
-    if days > 1:
-        start_dt = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=days - 1)
-        period_rows = fetch_reports(start_date=start_dt.strftime("%Y-%m-%d"))
-        period_title = f"Last {days} Days"
-    else:
-        period_rows = fetch_reports(date_filter=today_str)
-        period_title = f"Reports {today_str}"
+    missed_rate = get_missed_penalty_rs()
+    reg_rate, fin_rate, _ = get_penalty_config()
 
     all_rows = fetch_reports()
+    if month_str:
+        start_str = f"{month_str}-01"
+        y, m = map(int, month_str.split("-"))
+        next_m = datetime(y + (1 if m == 12 else 0), (m % 12) + 1, 1) - timedelta(days=1)
+        end_str = min(next_m.strftime("%Y-%m-%d"), now_ist.strftime("%Y-%m-%d"))
+        period_rows = [r for r in all_rows if start_str <= r[4] <= end_str]
+        date_list = _dates_for_period(start_str, end_str)
+        period_title = f"Month {month_str}"
+        ref_label = month_str
+    elif days > 1:
+        start_dt = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=days - 1)
+        start_str = start_dt.strftime("%Y-%m-%d")
+        period_rows = [r for r in all_rows if start_str <= r[4] <= today_str]
+        date_list = _dates_for_period(start_str, today_str)
+        period_title = f"Last {days} Days"
+        ref_label = today_str
+    else:
+        period_rows = [r for r in all_rows if r[4] == today_str]
+        date_list = [today_str]
+        period_title = f"Reports {today_str}"
+        ref_label = today_str
+
     excluded_keys = {_match_key(u) for u in get_summary_excluded()}
     _admin_ids, admin_keys = get_known_admin_sets()
     hidden_keys = excluded_keys | admin_keys
@@ -1330,51 +2087,33 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
     ]
     _style_sheet(ws_log, log_headers, period_excel_rows, status_col_idx=6)
 
+    stats_list = compute_member_stats_for_period(members, period_rows, date_list, now_ist)
+    target_val = get_daily_joining_target()
+
     ws_summary = wb.create_sheet(title="Member Summary")
     summary_rows: list[tuple[str, ...]] = []
-    for member in members:
-        m_key = _match_key(member)
-        member_rows = [r for r in period_rows if _match_key(r[0]) == m_key]
-        on_time = sum(1 for r in member_rows if r[5] == "On Time")
-        late_5 = sum(1 for r in member_rows if r[6] == PENALTY_LATE_REGULAR_RS)
-        late_10 = sum(1 for r in member_rows if r[6] >= PENALTY_LATE_FINAL_RS)
-        other_late = sum(1 for r in member_rows if r[5] != "On Time" and r[6] == 0)
-        late_pen = sum(r[6] for r in member_rows)
-        total_joining = sum(_safe_int(r[1]) for r in member_rows)
-
-        if days > 1:
-            start_dt = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=days - 1)
-            missed = 0
-            for d_idx in range(days):
-                d_str = (start_dt + timedelta(days=d_idx)).strftime("%Y-%m-%d")
-                d_closed = get_closed_slots_for_date(d_str, now_ist)
-                d_submitted = {r[3] for r in member_rows if r[4] == d_str}
-                missed += sum(1 for s in d_closed if s.label not in d_submitted)
-            expected_slots = sum(
-                len(get_closed_slots_for_date((start_dt + timedelta(days=i)).strftime("%Y-%m-%d"), now_ist))
-                for i in range(days)
-            )
-        else:
-            submitted_labels = {r[3] for r in member_rows}
-            missed = sum(1 for s in closed_today_slots if s.label not in submitted_labels)
-            expected_slots = len(closed_today_slots)
-
-        missed_pen = missed * PENALTY_MISSED_RS
-        total_pen = late_pen + missed_pen
-        compliance = round((on_time / expected_slots) * 100) if expected_slots else 100
+    for st in stats_list:
+        tgt_str = (
+            f"{'+' if st['target_diff'] >= 0 else ''}{st['target_diff']}"
+            if target_val > 0
+            else "—"
+        )
         summary_rows.append(
             (
-                member,
-                str(total_joining),
-                str(on_time),
-                str(late_5),
-                str(late_10 + other_late),
-                str(missed),
-                f"₹{late_pen}",
-                f"₹{missed_pen}",
-                f"₹{total_pen}",
-                f"{compliance}%",
-                today_str,
+                str(st["member"]),
+                str(st["shift"]).upper(),
+                str(st["total_joining"]),
+                tgt_str,
+                str(st["on_time"]),
+                str(st["late_regular"]),
+                str(st["late_final"]),
+                str(st["missed"]),
+                f"₹{st['late_pen']}",
+                f"₹{st['missed_pen']}",
+                f"₹{st['paid_rs']} / ₹{st['waived_rs']}",
+                f"₹{st['balance_due']}",
+                f"{st['compliance']}%",
+                ref_label,
             )
         )
 
@@ -1382,36 +2121,41 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
         ws_summary,
         [
             "Username",
-            "Total Joining",
+            "Shift",
+            "Valid Joining",
+            "Target Diff",
             "Submitted On Time",
-            "Late (₹5)",
-            "Final Late (₹10)",
+            f"Late (₹{reg_rate})",
+            f"Final Late (₹{fin_rate})",
             "Missed Slots",
             "Late Penalty",
-            "Missed Penalty (₹15)",
-            "Total Penalty",
+            f"Missed Penalty (₹{missed_rate})",
+            "Paid / Waived",
+            "Balance Due",
             "Compliance %",
-            "Reference Date",
+            "Reference",
         ],
         summary_rows,
     )
 
     target_day_rows = fetch_reports(date_filter=today_str)
+    leaves_today = get_leaves_for_date(today_str)
+    shifts_map = get_assistant_shifts()
+    is_off_today, _ = is_date_holiday_or_off(today_str)
+
     ws_matrix = wb.create_sheet(title="Slot Matrix")
     matrix_rows: list[tuple[str, ...]] = []
     for member in members:
-        member_day_slots = {
-            r[3]: (r[1], r[2], r[5], r[6])
-            for r in target_day_rows
-            if _match_key(r[0]) == _match_key(member)
-        }
+        m_key = _match_key(member)
+        member_day_rows = [r for r in target_day_rows if _match_key(r[0]) == m_key]
+        member_day_slots = {r[3]: (r[1], r[2], r[5], r[6]) for r in member_day_rows}
+        member_leaves = leaves_today.get(m_key, set())
+        member_allowed = get_slots_for_member(member, shifts_map)
         row_cells = [member]
-        day_joining = 0
         for label in slot_labels:
             if label in member_day_slots:
                 j_val, t_val, st_val, pen_val = member_day_slots[label]
-                day_joining += _safe_int(j_val)
-                if st_val == "On Time":
+                if st_val.startswith("On Time"):
                     row_cells.append(
                         f"Join: {j_val} ({t_val})" if j_val else f"On Time ({t_val})"
                     )
@@ -1420,16 +2164,24 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
                     row_cells.append(
                         f"{pen_tag}: {j_val} ({t_val})" if j_val else f"{pen_tag} ({t_val})"
                     )
+            elif is_off_today:
+                row_cells.append("Holiday/Off")
+            elif "" in member_leaves or label in member_leaves:
+                row_cells.append("On Leave")
+            elif label not in member_allowed:
+                row_cells.append("Off Shift")
             elif label in closed_today_labels:
-                row_cells.append(f"Missed (₹{PENALTY_MISSED_RS})")
+                row_cells.append(f"Missed (₹{missed_rate})")
             else:
                 row_cells.append("Pending")
+        # Valid daily cumulative joining (latest slot value, NOT sum of snapshots!)
+        day_joining = compute_daily_joining_from_rows(member_day_rows)
         row_cells.append(str(day_joining))
         matrix_rows.append(tuple(row_cells))
 
     _style_sheet(
         ws_matrix,
-        ["Username", "10:00 AM", "1:00 PM", "3:00 PM", "5:00 PM", "Final (<8 PM)", "Total Joining"],
+        ["Username", "10:00 AM", "1:00 PM", "3:00 PM", "5:00 PM", "Final (<8 PM)", "Valid Daily Joining"],
         matrix_rows,
     )
 
@@ -1446,6 +2198,9 @@ def build_excel_bytes(target_date: Optional[str] = None, days: int = 1) -> tuple
     if excel_gid is not None:
         cfg_rows.append(("excel_group_id", str(excel_gid), ""))
     cfg_rows.append(("reminders_enabled", "true" if is_reminders_enabled() else "false", ""))
+    cfg_rows.append(("penalty_config", f"{reg_rate},{fin_rate},{missed_rate}", ""))
+    cfg_rows.append(("daily_joining_target", str(target_val), ""))
+    cfg_rows.append(("per_joining_rate", str(get_per_joining_rate()), ""))
 
     with sqlite3.connect(DB_PATH) as conn:
         tag_rows = conn.execute(
@@ -1685,10 +2440,21 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                                 "INSERT INTO bot_settings (key, value) VALUES ('excel_group_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                                 (str(parsed),),
                             )
-                    elif key == "reminders_enabled" and str(val).lower() in ("true", "false"):
+                    elif key in (
+                        "reminders_enabled",
+                        "clean_chat_mode",
+                        "holiday_mode",
+                        "off_days",
+                        "daily_joining_target",
+                        "per_joining_rate",
+                        "penalty_late_regular",
+                        "penalty_late_final",
+                        "penalty_missed",
+                        "dm_started_users",
+                    ) and val is not None:
                         dst.execute(
-                            "INSERT INTO bot_settings (key, value) VALUES ('reminders_enabled', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (str(val).lower(),),
+                            "INSERT INTO bot_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            (str(key), str(val)),
                         )
 
             if "team_members" in tables:
@@ -1931,50 +2697,188 @@ def _build_tags_panel(current_chat_id: Optional[int] = None) -> tuple[str, Inlin
 # ---------------------------------------------------------------------------
 # Interactive Summary View & Name Removal Manager (/summary)
 # ---------------------------------------------------------------------------
-def _build_summary_view(today_str: str) -> tuple[str, InlineKeyboardMarkup]:
-    rows = fetch_reports(today_str)
-    members = get_team_members()
-    excluded = get_summary_excluded()
-    excluded_keys = {_match_key(u) for u in excluded}
+def _get_visible_members_for_rows(
+    period_rows: list[tuple[str, str, str, str, str, str, int, str]]
+) -> list[str]:
+    excluded_keys = {_match_key(u) for u in get_summary_excluded()}
     _admin_ids, admin_keys = get_known_admin_sets()
     hidden_keys = excluded_keys | admin_keys
-    closed_slots = get_closed_slots_for_date(today_str)
-
-    visible_rows = [r for r in rows if _match_key(r[0]) not in admin_keys]
-
-    all_names = [
-        name
-        for name in _dedup_case_insensitive(members + [r[0] for r in visible_rows])
-        if _match_key(name) not in hidden_keys
+    return [
+        m
+        for m in _dedup_case_insensitive(
+            get_team_members() + get_tagged_assistants() + [r[0] for r in period_rows]
+        )
+        if _match_key(m) not in hidden_keys
     ]
 
-    total_late_pen = 0
-    total_missed_pen = 0
+
+def build_payout_excel_bytes(
+    target_date: Optional[str] = None,
+    days: int = 7,
+    rate_per_joining: Optional[int] = None,
+) -> tuple[BytesIO, int]:
+    now_ist = datetime.now(IST)
+    today_str = target_date or now_ist.strftime("%Y-%m-%d")
+    start_dt = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=days - 1)
+    start_str = start_dt.strftime("%Y-%m-%d")
+    date_list = _dates_for_period(start_str, today_str)
+    all_rows = fetch_reports()
+    period_rows = [r for r in all_rows if start_str <= r[4] <= today_str]
+    members = _get_visible_members_for_rows(period_rows)
+    stats_list = compute_member_stats_for_period(members, period_rows, date_list, now_ist)
+    rate = rate_per_joining if rate_per_joining is not None else get_per_joining_rate()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Payout {days}D"
+    rows_out: list[tuple[str, ...]] = []
+    for st in stats_list:
+        gross_earn = int(st["total_joining"]) * rate
+        net_due_pen = int(st["balance_due"])
+        net_payout = gross_earn - net_due_pen
+        rows_out.append(
+            (
+                str(st["member"]),
+                str(st["total_joining"]),
+                f"₹{rate}",
+                f"₹{gross_earn}",
+                f"₹{st['gross_pen']}",
+                f"₹{st['paid_rs']}",
+                f"₹{st['waived_rs']}",
+                f"₹{net_due_pen}",
+                f"₹{net_payout}",
+                f"{st['compliance']}%",
+            )
+        )
+    _style_sheet(
+        ws,
+        [
+            "Username",
+            "Valid Joinings",
+            "Rate / Join",
+            "Gross Joining Amt",
+            "Gross Penalty",
+            "Paid",
+            "Waived",
+            "Balance Fine Due",
+            "Net Payout",
+            "Compliance %",
+        ],
+        rows_out,
+    )
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out, len(stats_list)
+
+
+def _build_daily_penalty_text(today_str: str) -> str:
+    rows = fetch_reports(today_str)
+    is_off, off_reason = is_date_holiday_or_off(today_str)
+    if is_off:
+        return f"🌴 <b>{html.escape(off_reason)} ({today_str})</b>\nNo missed penalties applied today!"
+    members = _get_visible_members_for_rows(rows)
+    stats = compute_member_stats_for_period(members, rows, [today_str])
+    pen_lines: list[str] = []
+    total_due = 0
+    for st in stats:
+        due = int(st["balance_due"])
+        if int(st["gross_pen"]) <= 0:
+            continue
+        total_due += due
+        parts: list[str] = []
+        if int(st["missed"]) > 0:
+            parts.append(f"{st['missed']} Missed (₹{st['missed_pen']})")
+        late_cnt = int(st["late_regular"]) + int(st["late_final"])
+        if late_cnt > 0:
+            parts.append(f"{late_cnt} Late (₹{st['late_pen']})")
+        adj = int(st["paid_rs"]) + int(st["waived_rs"])
+        adj_note = f" [Paid/Waived: ₹{adj}]" if adj > 0 else ""
+        pen_lines.append(
+            f"- {html.escape(str(st['member']))} — {' + '.join(parts)}{adj_note} = <b>₹{due}</b>"
+        )
+    if not pen_lines:
+        return f"🎉 <b>Penalty Report ({today_str} IST)</b>\nZero penalties today! Everyone is On Time! 👏"
+    return (
+        f"🚨 <b>Daily Penalty &amp; Missed Summary ({today_str} IST)</b>\n"
+        f"Total Net Penalty Due: <b>₹{total_due}</b>\n\n"
+        + "\n".join(pen_lines)
+        + "\n\n<i>Admins can use /paid @user amt or /waive @user amt</i>"
+    )
+
+
+def _build_leaderboard_text(today_str: str) -> str:
+    rows = fetch_reports(today_str)
+    members = _get_visible_members_for_rows(rows)
+    stats = compute_member_stats_for_period(members, rows, [today_str])
+    ranked = sorted(
+        stats,
+        key=lambda s: (int(s["total_joining"]), int(s["on_time"]), -int(s["gross_pen"])),
+        reverse=True,
+    )
+    target_val = get_daily_joining_target()
+    medals = ("🥇", "🥈", "🥉")
+    lines = [f"🏆 <b>Daily Leaderboard ({today_str} IST)</b>"]
+    if not ranked:
+        lines.append("No active assistants found today.")
+        return "\n".join(lines)
+    total_team_join = sum(int(s["total_joining"]) for s in ranked)
+    lines.append(f"Team Valid Total Joining: <b>{total_team_join}</b>\n")
+    for idx, st in enumerate(ranked[:15]):
+        badge = medals[idx] if idx < 3 else f"#{idx + 1}"
+        tgt_note = ""
+        if target_val > 0 and int(st["leave_days"]) == 0:
+            diff = int(st["target_diff"])
+            tgt_note = f" | 🎯 {'+' if diff >= 0 else ''}{diff}"
+        star = " ⭐100%" if int(st["compliance"]) == 100 and int(st["on_time"]) > 0 else ""
+        lines.append(
+            f"{badge} {html.escape(str(st['member']))}: <b>{st['total_joining']}</b> Join | {st['on_time']}/{max(len(st['allowed_slots']), 1)} On-Time{tgt_note}{star}"
+        )
+    return "\n".join(lines)
+
+
+def _build_summary_view(today_str: str) -> tuple[str, InlineKeyboardMarkup]:
+    rows = fetch_reports(today_str)
+    _admin_ids, admin_keys = get_known_admin_sets()
+    visible_rows = [r for r in rows if _match_key(r[0]) not in admin_keys]
+    all_names = _get_visible_members_for_rows(visible_rows)
+    stats = compute_member_stats_for_period(all_names, visible_rows, [today_str])
+    target_val = get_daily_joining_target()
+    is_off, off_reason = is_date_holiday_or_off(today_str)
+
+    total_joining_team = sum(int(st["total_joining"]) for st in stats)
+    total_late_pen = sum(int(st["late_pen"]) for st in stats)
+    total_missed_pen = sum(int(st["missed_pen"]) for st in stats)
+    total_due = sum(int(st["balance_due"]) for st in stats)
+
     per_user_lines: list[str] = []
-    for name in all_names:
-        m_key = _match_key(name)
-        u_rows = [r for r in visible_rows if _match_key(r[0]) == m_key]
-        u_late = sum(1 for r in u_rows if r[5] != "On Time")
-        u_late_pen = sum(r[6] for r in u_rows)
-        submitted_slots = {r[3] for r in u_rows}
-        u_missed = sum(1 for s in closed_slots if s.label not in submitted_slots)
-        u_missed_pen = u_missed * PENALTY_MISSED_RS
-        u_total_pen = u_late_pen + u_missed_pen
-        u_join = sum(_safe_int(r[1]) for r in u_rows)
-
-        total_late_pen += u_late_pen
-        total_missed_pen += u_missed_pen
-
-        late_note = f" ({u_late} Late)" if u_late > 0 else ""
-        miss_note = f" | Missed: {u_missed} (₹{u_missed_pen})" if u_missed > 0 else ""
-        pen_note = f" | Total Penalty: <b>₹{u_total_pen}</b>" if u_total_pen > 0 else ""
+    for st in stats:
+        late_cnt = int(st["late_regular"]) + int(st["late_final"])
+        late_note = f" ({late_cnt} Late)" if late_cnt > 0 else ""
+        miss_note = f" | Missed: {st['missed']} (₹{st['missed_pen']})" if int(st["missed"]) > 0 else ""
+        leave_note = " | <b>ON LEAVE</b>" if int(st["leave_days"]) > 0 else ""
+        tgt_note = ""
+        if target_val > 0 and int(st["leave_days"]) == 0:
+            diff = int(st["target_diff"])
+            tgt_note = f" | 🎯 {'+' if diff >= 0 else ''}{diff}"
+        due = int(st["balance_due"])
+        gross = int(st["gross_pen"])
+        if due > 0:
+            pen_note = f" | Due: <b>₹{due}</b>"
+        elif gross > 0:
+            pen_note = " | <b>Paid/Waived ₹0</b>"
+        else:
+            pen_note = ""
+        slot_cap = len(st["allowed_slots"])
         per_user_lines.append(
-            f"- {html.escape(name)}: {len(u_rows)}/5 slots{late_note} | Joining: {u_join}{miss_note}{pen_note}"
+            f"- {html.escape(str(st['member']))}: {st['submitted_count']}/{slot_cap} slots{late_note} | Joining: <b>{st['total_joining']}</b>{tgt_note}{leave_note}{miss_note}{pen_note}"
         )
 
+    off_banner = f"\n🌴 <b>{html.escape(off_reason)}</b> (Missed penalties paused)" if is_off else ""
     lines = [
-        f"<b>Daily Summary ({today_str} IST)</b>",
-        f"Total Slot Reports: <b>{len(visible_rows)}</b> | Team Penalty: <b>₹{total_late_pen + total_missed_pen}</b> (Late: ₹{total_late_pen} + Missed: ₹{total_missed_pen})",
+        f"<b>Daily Summary ({today_str} IST)</b>{off_banner}",
+        f"Valid Team Joining: <b>{total_joining_team}</b> | Slot Logs: <b>{len(visible_rows)}</b>",
+        f"Net Fine Due: <b>₹{total_due}</b> (Gross: ₹{total_late_pen + total_missed_pen} | Late: ₹{total_late_pen} + Missed: ₹{total_missed_pen})",
         "",
     ]
     if not per_user_lines:
@@ -2053,33 +2957,86 @@ def _is_admin(update: Update) -> bool:
 # ---------------------------------------------------------------------------
 # Telegram Command & Callback Handlers
 # ---------------------------------------------------------------------------
+def mark_user_dm_started(user_id: Optional[int], username: str = "") -> None:
+    if user_id is None:
+        return
+    raw = get_setting("dm_started_users", "[]")
+    try:
+        arr = json.loads(raw or "[]")
+        if not isinstance(arr, list):
+            arr = []
+    except Exception:
+        arr = []
+    uid_int = int(user_id)
+    if uid_int not in arr:
+        arr.append(uid_int)
+        set_setting("dm_started_users", json.dumps(arr))
+
+
+def get_dm_started_user_ids() -> set[int]:
+    raw = get_setting("dm_started_users", "[]")
+    try:
+        arr = json.loads(raw or "[]")
+        return {int(x) for x in arr if str(x).lstrip("-").isdigit()} if isinstance(arr, list) else set()
+    except Exception:
+        return set()
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or not update.effective_user:
         return
 
+    user = update.effective_user
+    uname = f"@{user.username}" if user.username else (user.first_name or "Assistant")
+    if update.effective_chat.type == "private":
+        await asyncio.to_thread(mark_user_dm_started, user.id, uname)
+        if not _is_admin(update) and not is_known_group_admin(uname, user.id):
+            await asyncio.to_thread(auto_discover_assistant, uname, user.id)
+            await update.message.reply_text(
+                f"✅ <b>Personal DM Alerts Activated!</b>\n\n"
+                f"Hi <b>{html.escape(uname)}</b>, ab aapko slot deadlines aur 15-min penalty countdown ke urgent alerts direct DM mein milenge.\n\n"
+                f"<b>Useful Commands:</b>\n"
+                f"/mystatus — Aaj ki valid joining, slots &amp; penalty dekhein\n"
+                f"/myfine — Apna fine balance &amp; payment history dekhein\n"
+                f"/summary — Aaj ki team summary\n"
+                f"/leaderboard — Aaj ke top performers",
+                parse_mode="HTML",
+            )
+            return
+
     rem_status = "ON" if is_reminders_enabled() else "OFF"
-    work_gid = get_work_group_id() or "Not set"
+    clean_status = "ON" if is_clean_chat_enabled() else "OFF"
+    dm_started_count = len(get_dm_started_user_ids())
+    work_gids = get_all_work_group_ids()
+    work_gid_str = ", ".join(str(g) for g in work_gids) if work_gids else "Not set"
     excel_gid = get_excel_group_id() or "Not set"
     tagged_count = len(get_tagged_assistants())
+    reg_p, fin_p, miss_p = get_penalty_config()
 
     await update.message.reply_text(
         f"<b>Excel Report Tracker Bot is active.</b>\n"
         f"Your User ID (<code>ADMIN_CHAT_ID</code>): <code>{update.effective_user.id}</code>\n"
         f"Current Chat ID: <code>{update.effective_chat.id}</code>\n"
-        f"Work Group: <code>{work_gid}</code> | Excel Group: <code>{excel_gid}</code>\n"
-        f"Slot Reminders: <b>{rem_status}</b> | Tagged Assistants: <b>{tagged_count}</b>\n\n"
-        f"<b>Assistant Tag Controls:</b>\n"
-        f"/tags - Open interactive button panel\n"
-        f"/settags @a @b - Set exact assistants to tag\n"
-        f"/addtag @a | /removetag @a | /cleartags\n"
-        f"/reminder on | /reminder off - Toggle reminder warnings\n\n"
-        f"<b>Backfill &amp; Excel Setup:</b>\n"
-        f"/add (reply to any already-sent report) - Add with original timing\n"
-        f"/addreport @user 40 [10am] - Manually add or bulk paste past reports\n"
-        f"/countdown [10am|1pm|3pm|5pm|final|stop] - Start/stop 15m penalty countdown\n"
-        f"/removesummary @a | /restoresummary @a - Remove/restore name in Summary\n"
-        f"/setworkgroup | /setexcelgroup | /check - Link &amp; diagnose groups\n"
-        f"/excel [YYYY-MM-DD] | /weekly | /summary | /mystatus",
+        f"Work Group(s): <code>{work_gid_str}</code> | Excel Group: <code>{excel_gid}</code>\n"
+        f"Reminders: <b>{rem_status}</b> | Clean Chat: <b>{clean_status}</b> | Tagged: <b>{tagged_count}</b>\n"
+        f"Assistant DM Mode: <b>Bot API Only (/start required | {dm_started_count} active, Admins Excluded)</b>\n"
+        f"Penalties: Regular ₹{reg_p} | Final ₹{fin_p} | Missed ₹{miss_p}\n\n"
+        f"<b>Daily Tracking &amp; Excel Reports:</b>\n"
+        f"/excel [YYYY-MM-DD] | /weekly | /monthly [YYYY-MM] | /payout [days] [rate]\n"
+        f"/summary | /leaderboard | /mystatus | /myfine [@user]\n"
+        f"/find @user [days] | /day [YYYY-MM-DD]\n\n"
+        f"<b>Assistant DM Alerts (/start Only — Admins Excluded):</b>\n"
+        f"/dmstatus | /dmtest @assistant\n\n"
+        f"<b>Admin Controls &amp; Backfill:</b>\n"
+        f"/add (reply) | /addreport @user 40 [10am]\n"
+        f"/tags | /settags @a @b | /addtag | /removetag | /cleartags\n"
+        f"/reminder on|off | /cleanchat on|off | /countdown [slot|stop]\n"
+        f"/leave @user [date] [slot] | /unleave @user [date]\n"
+        f"/paid @user amt | /waive @user amt | /setshift @user morning|evening|full\n"
+        f"/settarget N | /setrate Rs | /setpenalty regular 5 final 10 missed 15\n"
+        f"/holiday on|off | /offdays sun|sat,sun|none | /alias @old @new | /aliases\n"
+        f"/removesummary @a | /restoresummary @a | /restore\n"
+        f"/setworkgroup | /addworkgroup | /removeworkgroup | /groups | /setexcelgroup | /check",
         parse_mode="HTML",
     )
 
@@ -2088,15 +3045,17 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.message or not update.effective_chat or not update.effective_user:
         return
     chat = update.effective_chat
+    work_gids = get_all_work_group_ids()
     work_gid = get_work_group_id()
     excel_gid = get_excel_group_id()
     ist_now = datetime.now(IST)
     active_slot = detect_active_slot(ist_now)
     resolved_slot, resolved_status, resolved_pen = resolve_submission_slot_and_penalty(ist_now)
-    matches_work = work_gid is None or chat.id == work_gid
-    same_as_excel = excel_gid is not None and chat.id == excel_gid and excel_gid != work_gid
+    matches_work = is_allowed_work_group(chat.id)
+    same_as_excel = excel_gid is not None and chat.id == excel_gid and not is_allowed_work_group(chat.id)
     total_reports = await asyncio.to_thread(count_total_reports)
     total_members = len(await asyncio.to_thread(get_team_members))
+    is_off, off_reason = is_date_holiday_or_off(ist_now.strftime("%Y-%m-%d"))
 
     pinned_backup_status = "No Excel/Database Group configured"
     if excel_gid is not None:
@@ -2111,21 +3070,22 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             pinned_backup_status = f"Cannot access Database Group ({exc})"
 
     slot_display = active_slot or (f"{resolved_slot} [{resolved_status}]" if resolved_slot else "None (Before 10:00 AM)")
+    work_disp = ", ".join(str(g) for g in work_gids) if work_gids else "Any Group"
     lines = [
         "<b>Bot Diagnostic Check</b>",
         f"Current Chat ID: <code>{chat.id}</code> ({html.escape(chat.type)})",
-        f"Configured Work Group (<code>ALLOWED_CHAT_ID</code>): <code>{work_gid or 'Any Group'}</code>",
+        f"Configured Work Group(s): <code>{work_disp}</code>",
         f"Database/Excel Group (<code>EXCEL_GROUP_ID</code>): <code>{excel_gid or 'Not set'}</code>",
         f"Saved Data: <b>{total_reports}</b> reports | <b>{total_members}</b> assistants",
         f"Database Backup: {html.escape(pinned_backup_status)}",
         f"Current IST Time: <b>{ist_now.strftime('%Y-%m-%d %I:%M:%S %p IST')}</b>",
         f"Active Slot / Penalty Now: <b>{html.escape(slot_display)}</b> (₹{resolved_pen})",
+        f"Holiday / Off Status: <b>{html.escape(off_reason) if is_off else 'Working Day'}</b>",
         f"Report Recording Here: <b>{'YES' if (matches_work and not same_as_excel) else 'NO (Group Mismatch)'}</b>",
     ]
     if not matches_work:
         lines.append(
-            f"\n<b>Fix:</b> Send <code>/setworkgroup</code> here AND update Render "
-            f"<code>ALLOWED_CHAT_ID</code> to <code>{chat.id}</code>."
+            f"\n<b>Fix:</b> Send <code>/setworkgroup</code> or <code>/addworkgroup</code> here."
         )
     elif same_as_excel:
         lines.append(
@@ -2448,6 +3408,66 @@ async def tags_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
 
+    if data.startswith("late_ok:"):
+        rid = _safe_int(data.split(":", 1)[1])
+        res = await asyncio.to_thread(mark_report_waived_on_time, rid)
+        if not res:
+            await query.answer("Report record not found.", show_alert=True)
+            return
+        uname, slot_lbl, rdate = res
+        await query.answer(f"Marked {uname} On Time (₹0)!")
+        await push_excel_to_group(
+            context,
+            target_date=rdate,
+            caption=f"Excel Updated (Admin Approved ₹0) | {uname} | {slot_lbl} | {rdate}",
+        )
+        if query.message:
+            orig_text = getattr(query.message, "text_html", None) or getattr(query.message, "text", "") or ""
+            updated_text = f"{orig_text}\n\n✅ <b>Admin Override: Approved On Time (₹0 Penalty)</b>"
+            try:
+                await query.edit_message_text(text=updated_text, reply_markup=None, parse_mode="HTML")
+            except Exception:
+                pass
+        return
+
+    if data.startswith("late_keep:"):
+        await query.answer("Late penalty confirmed.")
+        if query.message:
+            orig_text = getattr(query.message, "text_html", None) or getattr(query.message, "text", "") or ""
+            try:
+                await query.edit_message_text(
+                    text=f"{orig_text}\n\n🔒 <i>Late penalty confirmed by Admin</i>",
+                    reply_markup=None,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        return
+
+    if data.startswith("late_del:"):
+        rid = _safe_int(data.split(":", 1)[1])
+        res = await asyncio.to_thread(delete_report_by_id, rid)
+        if not res:
+            await query.answer("Report already deleted.", show_alert=True)
+            return
+        uname, slot_lbl, rdate = res
+        await query.answer(f"Deleted {slot_lbl} report for {uname}.")
+        await push_excel_to_group(
+            context,
+            target_date=rdate,
+            caption=f"Excel Updated (Admin Deleted) | {uname} | {slot_lbl} | {rdate}",
+        )
+        if query.message:
+            try:
+                await query.edit_message_text(
+                    text=f"🗑 <b>Report Ignored &amp; Deleted by Admin</b>\n({html.escape(uname)} | {html.escape(slot_lbl)})",
+                    reply_markup=None,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        return
+
     if data == "sum_manage":
         await query.answer()
         text, markup = await asyncio.to_thread(_build_summary_manage_panel, today_str)
@@ -2707,21 +3727,41 @@ async def mystatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     user = update.effective_user
     username = f"@{user.username}" if user.username else (user.first_name or "Unknown User")
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    day_rows = await asyncio.to_thread(fetch_reports, today_str)
+    stats_list = await asyncio.to_thread(
+        compute_member_stats_for_period, [username], day_rows, [today_str], now_ist
+    )
+    st = stats_list[0]
     submitted_map = await asyncio.to_thread(fetch_user_today_slots, username, today_str)
-    closed_labels = {s.label for s in get_closed_slots_for_date(today_str)}
+    closed_labels = {s.label for s in get_closed_slots_for_date(today_str, now_ist)}
+    allowed_slots = st["allowed_slots"]
+    leaves_map = await asyncio.to_thread(get_leaves_for_date, today_str)
+    user_leaves = leaves_map.get(_match_key(username), set())
+    missed_pen_rate = get_missed_penalty_rs()
+    target_val = get_daily_joining_target()
+    is_off, off_reason = is_date_holiday_or_off(today_str)
 
-    late_pen = sum(v[3] for v in submitted_map.values())
-    missed_count = sum(1 for s in REPORTING_SLOTS if s.label in closed_labels and s.label not in submitted_map)
-    missed_pen = missed_count * PENALTY_MISSED_RS
-    total_pen = late_pen + missed_pen
+    tgt_line = ""
+    if target_val > 0:
+        diff = int(st["target_diff"])
+        tgt_line = f" | Target: {target_val} ({'+' if diff >= 0 else ''}{diff})"
 
     lines = [
         f"<b>Slot Status for {html.escape(username)} ({today_str})</b>",
-        f"Total Penalty Today: <b>₹{total_pen}</b> (Late: ₹{late_pen} + Missed: ₹{missed_pen})",
+        f"Shift: <b>{html.escape(str(st['shift']).upper())}</b> | Valid Daily Joining: <b>{st['total_joining']}</b>{tgt_line}",
+        f"Fine Due Today: <b>₹{st['balance_due']}</b> (Gross: ₹{st['gross_pen']} | Paid/Waived: ₹{int(st['paid_rs']) + int(st['waived_rs'])})",
     ]
+    if is_off:
+        lines.append(f"🌴 <b>{html.escape(off_reason)}</b> — Missed penalties paused")
+
     for slot in REPORTING_SLOTS:
-        if slot.label in submitted_map:
+        if slot.label not in allowed_slots:
+            lines.append(f"- {html.escape(slot.label)}: Off-Shift")
+        elif "" in user_leaves or slot.label in user_leaves:
+            lines.append(f"- {html.escape(slot.label)}: <b>ON LEAVE (₹0)</b>")
+        elif slot.label in submitted_map:
             sub_t, j_val, st_val, pen_val = submitted_map[slot.label]
             j_note = f" | Join: {html.escape(j_val)}" if j_val else ""
             pen_note = f" | <b>{html.escape(st_val)}</b>" if pen_val > 0 else " | On Time (₹0)"
@@ -2729,19 +3769,571 @@ async def mystatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"- {html.escape(slot.label)}: Done ({html.escape(sub_t)}{j_note}{pen_note})"
             )
         elif slot.label in closed_labels:
-            lines.append(f"- {html.escape(slot.label)}: <b>Missed (₹{PENALTY_MISSED_RS} Penalty)</b>")
+            lines.append(f"- {html.escape(slot.label)}: <b>Missed (₹{missed_pen_rate} Penalty)</b>")
         else:
             lines.append(f"- {html.escape(slot.label)}: Pending")
 
     if update.effective_chat and update.effective_chat.type != "private":
-        work_gid = get_work_group_id()
-        if work_gid is not None and update.effective_chat.id != work_gid:
+        if not is_allowed_work_group(update.effective_chat.id):
             lines.append(
-                f"\n<b>Warning:</b> This group (<code>{update.effective_chat.id}</code>) does not match "
-                f"Work Group (<code>{work_gid}</code>). Send <code>/setworkgroup</code> here and update "
-                f"<code>ALLOWED_CHAT_ID={update.effective_chat.id}</code> on Render!"
+                f"\n<b>Warning:</b> This group (<code>{update.effective_chat.id}</code>) is not registered as a Work Group. "
+                f"Admin can run <code>/addworkgroup</code> or <code>/setworkgroup</code> here."
             )
 
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def leave_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/leave @user [today|YYYY-MM-DD] [10am|1pm|3pm|5pm|final|full]"""
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can grant leaves.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "<b>Usage:</b> <code>/leave @username [today|YYYY-MM-DD] [slot|full]</code>\n"
+            "Example: <code>/leave @Premgupta2m today 3pm</code> or <code>/leave @Premgupta2m</code>",
+            parse_mode="HTML",
+        )
+        return
+    raw_user = context.args[0]
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    leave_date = today_str
+    slot_label = ""
+    for tok in context.args[1:]:
+        low = tok.strip().lower()
+        if low == "today":
+            leave_date = today_str
+        elif low == "tomorrow":
+            leave_date = (datetime.now(IST) + timedelta(days=1)).strftime("%Y-%m-%d")
+        elif low == "full":
+            slot_label = ""
+        elif re.match(r"^\d{4}-\d{2}-\d{2}$", low):
+            try:
+                datetime.strptime(low, "%Y-%m-%d")
+                leave_date = low
+            except ValueError:
+                pass
+        else:
+            parsed_s = parse_slot_alias(low)
+            if parsed_s:
+                slot_label = parsed_s
+
+    canon = await asyncio.to_thread(add_leave, raw_user, leave_date, slot_label)
+    scope_txt = slot_label if slot_label else "Full Day (All Slots)"
+    await update.message.reply_text(
+        f"🌴 <b>Leave Approved</b>\nAssistant: <code>{html.escape(canon)}</code>\nDate: <b>{leave_date}</b> | Scope: <b>{html.escape(scope_txt)}</b>\n<i>Zero missed penalty will be charged for this scope.</i>",
+        parse_mode="HTML",
+    )
+
+
+async def unleave_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can remove leaves.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: <code>/unleave @username [today|YYYY-MM-DD] [slot]</code>", parse_mode="HTML")
+        return
+    raw_user = context.args[0]
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    leave_date = today_str
+    slot_label = ""
+    for tok in context.args[1:]:
+        low = tok.strip().lower()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", low):
+            leave_date = low
+        else:
+            parsed_s = parse_slot_alias(low)
+            if parsed_s:
+                slot_label = parsed_s
+    removed = await asyncio.to_thread(remove_leave, raw_user, leave_date, slot_label)
+    await update.message.reply_text(
+        f"Removed {removed} leave record(s) for <code>{html.escape(raw_user)}</code> on {leave_date}."
+        if removed
+        else f"No matching leave found for <code>{html.escape(raw_user)}</code> on {leave_date}.",
+        parse_mode="HTML",
+    )
+
+
+async def _handle_ledger_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, entry_type: str
+) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can update penalty payments/waivers.")
+        return
+    if len(context.args) < 2 or not context.args[1].lstrip("₹").isdigit():
+        await update.message.reply_text(
+            f"Usage: <code>/{entry_type} @username 15 [optional note]</code>", parse_mode="HTML"
+        )
+        return
+    raw_user = context.args[0]
+    amt = int(context.args[1].lstrip("₹"))
+    note = " ".join(context.args[2:]).strip()
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    canon = await asyncio.to_thread(add_penalty_ledger_entry, raw_user, entry_type, amt, note, today_str)
+
+    # Calculate 30-day running balance due
+    start_30 = (datetime.now(IST) - timedelta(days=29)).strftime("%Y-%m-%d")
+    rows_30 = await asyncio.to_thread(fetch_reports, None, start_30)
+    dates_30 = _dates_for_period(start_30, today_str)
+    st = (await asyncio.to_thread(compute_member_stats_for_period, [canon], rows_30, dates_30))[0]
+    verb = "Payment Recorded" if entry_type == "paid" else "Fine Waived"
+    await update.message.reply_text(
+        f"💳 <b>{verb}</b>\n"
+        f"Assistant: <code>{html.escape(canon)}</code> | Amount: <b>₹{amt}</b>\n"
+        f"30-Day Gross Fine: ₹{st['gross_pen']} | Paid: ₹{st['paid_rs']} | Waived: ₹{st['waived_rs']}\n"
+        f"Remaining Balance Due: <b>₹{st['balance_due']}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_ledger_command(update, context, "paid")
+
+
+async def waive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_ledger_command(update, context, "waive")
+
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    target_date = datetime.now(IST).strftime("%Y-%m-%d")
+    if context.args and re.match(r"^\d{4}-\d{2}-\d{2}$", context.args[0].strip()):
+        target_date = context.args[0].strip()
+    text = await asyncio.to_thread(_build_leaderboard_text, target_date)
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if update.effective_chat.type == "private" and not _is_admin(update):
+        await update.message.reply_text("Unauthorized.")
+        return
+    month_str = datetime.now(IST).strftime("%Y-%m")
+    if context.args:
+        cand = context.args[0].strip()
+        if re.match(r"^\d{4}-\d{2}$", cand):
+            month_str = cand
+        else:
+            await update.message.reply_text("Usage: <code>/monthly [YYYY-MM]</code>", parse_mode="HTML")
+            return
+    stream, count = await asyncio.to_thread(build_excel_bytes, None, 1, month_str)
+    await update.message.reply_document(
+        document=stream,
+        filename=f"team_monthly_report_{month_str}.xlsx",
+        caption=f"Monthly Consolidated Excel ({month_str}) | Valid Daily Joining sums across days | Logs: {count}",
+    )
+
+
+async def payout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if update.effective_chat.type == "private" and not _is_admin(update):
+        await update.message.reply_text("Unauthorized.")
+        return
+    days = 7
+    rate: Optional[int] = None
+    for tok in context.args:
+        clean_t = tok.strip().lstrip("₹").lower()
+        if clean_t.endswith("d") and clean_t[:-1].isdigit():
+            days = max(1, min(90, int(clean_t[:-1])))
+        elif tok.strip().startswith("₹") or (clean_t.isdigit() and days != 7):
+            rate = int(clean_t)
+        elif clean_t.isdigit():
+            if int(clean_t) <= 31 and rate is None and len(context.args) >= 2:
+                days = max(1, int(clean_t))
+            else:
+                rate = int(clean_t)
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    used_rate = rate if rate is not None else get_per_joining_rate()
+    stream, m_count = await asyncio.to_thread(build_payout_excel_bytes, today_str, days, used_rate)
+    await update.message.reply_document(
+        document=stream,
+        filename=f"team_payout_{days}d_{today_str}.xlsx",
+        caption=(
+            f"💰 <b>Payout Sheet ({days} Days ending {today_str})</b>\n"
+            f"Rate: ₹{used_rate}/joining | Assistants: {m_count}\n"
+            f"(Tip: Set default rate via <code>/setrate 50</code>)"
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def setrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can set payout rate.")
+        return
+    if not context.args or not context.args[0].lstrip("₹").isdigit():
+        await update.message.reply_text(
+            f"Current Rate per Valid Joining: <b>₹{get_per_joining_rate()}</b>\nUsage: <code>/setrate 50</code>",
+            parse_mode="HTML",
+        )
+        return
+    rate = int(context.args[0].lstrip("₹"))
+    await asyncio.to_thread(set_setting, "per_joining_rate", str(rate))
+    await update.message.reply_text(f"Payout rate updated to <b>₹{rate}</b> per valid joining.", parse_mode="HTML")
+
+
+async def settarget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can set daily joining target.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            f"Current Daily Joining Target: <b>{get_daily_joining_target()}</b>\nUsage: <code>/settarget 50</code> (or <code>/settarget 0</code> to disable)",
+            parse_mode="HTML",
+        )
+        return
+    tgt = int(context.args[0])
+    await asyncio.to_thread(set_setting, "daily_joining_target", str(tgt))
+    await update.message.reply_text(
+        f"Daily Joining Target set to <b>{tgt}</b>." if tgt > 0 else "Daily Joining Target disabled.",
+        parse_mode="HTML",
+    )
+
+
+async def alias_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can link username aliases.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: <code>/alias @old_username @main_username</code>", parse_mode="HTML")
+        return
+    old_u, new_u, merged = await asyncio.to_thread(add_username_alias, context.args[0], context.args[1])
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    await push_excel_to_group(context, target_date=today_str, caption=f"Excel Merged Alias | {old_u} -> {new_u}")
+    await update.message.reply_text(
+        f"🔗 <b>Alias Linked &amp; History Merged</b>\n<code>{html.escape(old_u)}</code> ➡️ <code>{html.escape(new_u)}</code>\nMerged duplicate rows: <b>{merged}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def aliases_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    pairs = await asyncio.to_thread(get_username_aliases)
+    if not pairs:
+        await update.message.reply_text("No username aliases linked yet. Use <code>/alias @old @new</code>.", parse_mode="HTML")
+        return
+    lines = ["<b>Linked Username Aliases:</b>"] + [
+        f"- <code>{html.escape(a)}</code> ➡️ <code>{html.escape(t)}</code>" for a, t in pairs
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def holiday_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not context.args:
+        cur = get_setting("holiday_mode", "false")
+        await update.message.reply_text(
+            f"Holiday Mode is currently <b>{'ON' if cur == 'true' else 'OFF'}</b>.\nUse <code>/holiday on</code> or <code>/holiday off</code>.",
+            parse_mode="HTML",
+        )
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can toggle Holiday Mode.")
+        return
+    arg = context.args[0].strip().lower()
+    if arg in ("on", "true", "1", "yes"):
+        await asyncio.to_thread(set_setting, "holiday_mode", "true")
+        await update.message.reply_text("🌴 <b>Holiday Mode is ON</b> — Reminders &amp; missed penalties paused.", parse_mode="HTML")
+    elif arg in ("off", "false", "0", "no"):
+        await asyncio.to_thread(set_setting, "holiday_mode", "false")
+        await update.message.reply_text("✅ <b>Holiday Mode is OFF</b> — Normal reporting active.", parse_mode="HTML")
+    else:
+        await update.message.reply_text("Usage: <code>/holiday on</code> or <code>/holiday off</code>", parse_mode="HTML")
+
+
+async def offdays_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not context.args:
+        cur = get_setting("off_days", "") or "none"
+        await update.message.reply_text(
+            f"Recurring Off-Days: <b>{html.escape(cur.upper())}</b>\nUsage: <code>/offdays sun</code>, <code>/offdays sat,sun</code>, or <code>/offdays none</code>",
+            parse_mode="HTML",
+        )
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can set weekly off-days.")
+        return
+    raw = ",".join(context.args).lower()
+    if "none" in raw or "off" in raw:
+        await asyncio.to_thread(set_setting, "off_days", "")
+        await update.message.reply_text("Recurring weekly off-days cleared (all 7 days active).")
+        return
+    valid_days = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+    tokens = [t.strip()[:3] for t in raw.split(",") if t.strip()[:3] in valid_days]
+    unique_toks = list(dict.fromkeys(tokens))
+    if not unique_toks:
+        await update.message.reply_text("Valid days: <code>mon, tue, wed, thu, fri, sat, sun</code> or <code>none</code>", parse_mode="HTML")
+        return
+    val = ",".join(unique_toks)
+    await asyncio.to_thread(set_setting, "off_days", val)
+    await update.message.reply_text(f"🌴 Recurring Off-Days set to: <b>{html.escape(val.upper())}</b>", parse_mode="HTML")
+
+
+async def cleanchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"Clean Chat Mode (auto-delete previous reminders): <b>{'ON' if is_clean_chat_enabled() else 'OFF'}</b>\nUse <code>/cleanchat on</code> or <code>/cleanchat off</code>",
+            parse_mode="HTML",
+        )
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can toggle Clean Chat Mode.")
+        return
+    arg = context.args[0].strip().lower()
+    if arg in ("on", "true", "1"):
+        await asyncio.to_thread(set_setting, "clean_chat_mode", "true")
+        await update.message.reply_text("🧹 <b>Clean Chat Mode ON</b> — Previous slot reminders will be auto-deleted when a new slot starts.", parse_mode="HTML")
+    elif arg in ("off", "false", "0"):
+        await asyncio.to_thread(set_setting, "clean_chat_mode", "false")
+        await update.message.reply_text("Clean Chat Mode <b>OFF</b>.", parse_mode="HTML")
+    else:
+        await update.message.reply_text("Usage: <code>/cleanchat on</code> or <code>/cleanchat off</code>", parse_mode="HTML")
+
+
+async def setpenalty_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/setpenalty regular 5 final 10 missed 15"""
+    if not update.message:
+        return
+    reg_p, fin_p, miss_p = get_penalty_config()
+    if not context.args:
+        await update.message.reply_text(
+            f"<b>Current Penalty Rates:</b>\n"
+            f"- Regular Late (10am/1pm/3pm/5pm): <b>₹{reg_p}</b>\n"
+            f"- Final Late (after 8:00 PM): <b>₹{fin_p}</b>\n"
+            f"- Missed Slot: <b>₹{miss_p}</b>\n\n"
+            f"Update: <code>/setpenalty regular 5 final 10 missed 15</code>",
+            parse_mode="HTML",
+        )
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can change penalty rates.")
+        return
+    tokens = [t.strip().lower().lstrip("₹") for t in context.args]
+    new_reg, new_fin, new_miss = reg_p, fin_p, miss_p
+    i = 0
+    while i < len(tokens) - 1:
+        k, v = tokens[i], tokens[i + 1]
+        if v.isdigit():
+            if k in ("regular", "reg", "late"):
+                new_reg = int(v)
+            elif k in ("final", "fin"):
+                new_fin = int(v)
+            elif k in ("missed", "miss"):
+                new_miss = int(v)
+            i += 2
+            continue
+        i += 1
+    if len(tokens) == 3 and all(t.isdigit() for t in tokens):
+        new_reg, new_fin, new_miss = int(tokens[0]), int(tokens[1]), int(tokens[2])
+
+    await asyncio.to_thread(set_setting, "penalty_late_regular", str(new_reg))
+    await asyncio.to_thread(set_setting, "penalty_late_final", str(new_fin))
+    await asyncio.to_thread(set_setting, "penalty_missed", str(new_miss))
+    with sqlite3.connect(DB_PATH) as conn:
+        fixed = recalculate_report_statuses(conn)
+        conn.commit()
+    await update.message.reply_text(
+        f"⚙️ <b>Penalty Rates Updated</b>\nRegular Late: <b>₹{new_reg}</b> | Final Late: <b>₹{new_fin}</b> | Missed: <b>₹{new_miss}</b>\nSynced {fixed} existing row(s).",
+        parse_mode="HTML",
+    )
+
+
+async def setshift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not context.args:
+        shifts = await asyncio.to_thread(get_assistant_shifts)
+        lines = [
+            "<b>Assistant Shift Assignments:</b>",
+            "• <code>morning</code>: 10 AM, 1 PM, 3 PM",
+            "• <code>evening</code>: 3 PM, 5 PM, Final (8 PM)",
+            "• <code>full</code>: All 5 slots",
+            "",
+        ]
+        if shifts:
+            lines.extend(f"- @{html.escape(k)}: <b>{html.escape(v.upper())}</b>" for k, v in sorted(shifts.items()))
+        else:
+            lines.append("All assistants are on <b>FULL</b> shift by default.")
+        lines.append("\nSet: <code>/setshift @user morning|evening|full</code>")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can assign shifts.")
+        return
+    if len(context.args) < 2 or context.args[1].strip().lower() not in SHIFT_SLOTS:
+        await update.message.reply_text("Usage: <code>/setshift @user morning|evening|full</code>", parse_mode="HTML")
+        return
+    sh = context.args[1].strip().lower()
+    canon = await asyncio.to_thread(set_assistant_shift, context.args[0], sh)
+    slots_desc = ", ".join(sorted(SHIFT_SLOTS[sh], key=lambda x: SLOT_ORDER.get(x, 99)))
+    await update.message.reply_text(
+        f"🕒 Shift updated for <code>{html.escape(canon)}</code> ➡️ <b>{sh.upper()}</b>\nSlots: {html.escape(slots_desc)}",
+        parse_mode="HTML",
+    )
+
+
+async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: <code>/find @username [days=7]</code>", parse_mode="HTML")
+        return
+    raw_user = context.args[0]
+    days = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else 7
+    days = max(1, min(90, days))
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    start_str = (now_ist - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    date_list = _dates_for_period(start_str, today_str)
+    rows = await asyncio.to_thread(fetch_reports, None, start_str)
+    with sqlite3.connect(DB_PATH) as conn:
+        canon = _resolve_canonical_name(conn, raw_user) or _normalize_tag(raw_user) or raw_user
+    st = (await asyncio.to_thread(compute_member_stats_for_period, [canon], rows, date_list, now_ist))[0]
+    m_key = _match_key(canon)
+    m_rows = [r for r in rows if _match_key(r[0]) == m_key]
+    by_date: dict[str, list[tuple[str, str, str, str, str, str, int, str]]] = {}
+    for r in m_rows:
+        by_date.setdefault(r[4], []).append(r)
+
+    lines = [
+        f"🔍 <b>Assistant Lookup: {html.escape(canon)} (Last {days} Days)</b>",
+        f"Valid Joining Total: <b>{st['total_joining']}</b> | Compliance: <b>{st['compliance']}%</b>",
+        f"On-Time: {st['on_time']} | Late: {int(st['late_regular']) + int(st['late_final'])} | Missed: {st['missed']}",
+        f"Gross Fine: ₹{st['gross_pen']} | Paid: ₹{st['paid_rs']} | Waived: ₹{st['waived_rs']} | <b>Balance Due: ₹{st['balance_due']}</b>",
+        "",
+    ]
+    for d in reversed(date_list):
+        d_rows = by_date.get(d, [])
+        if not d_rows:
+            continue
+        day_j = compute_daily_joining_from_rows(d_rows)
+        slot_bits = ", ".join(
+            f"{r[3].split(' ')[0]}={r[1] or '-'}({'✓' if r[6] == 0 else f'₹{r[6]}'})"
+            for r in sorted(d_rows, key=lambda x: SLOT_ORDER.get(x[3], 99))
+        )
+        lines.append(f"• <b>{d}</b>: Valid Join <b>{day_j}</b> [{html.escape(slot_bits)}]")
+    if len(lines) <= 5:
+        lines.append("No submissions found in this period.")
+    await update.message.reply_text("\n".join(lines[:35]), parse_mode="HTML")
+
+
+async def day_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    target_date = datetime.now(IST).strftime("%Y-%m-%d")
+    if context.args:
+        cand = context.args[0].strip()
+        try:
+            datetime.strptime(cand, "%Y-%m-%d")
+            target_date = cand
+        except ValueError:
+            await update.message.reply_text("Usage: <code>/day YYYY-MM-DD</code>", parse_mode="HTML")
+            return
+    text, _markup = await asyncio.to_thread(_build_summary_view, target_date)
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def myfine_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    user = update.effective_user
+    self_name = f"@{user.username}" if user.username else (user.first_name or "Unknown User")
+    target_raw = context.args[0] if (context.args and _is_admin(update)) else self_name
+    with sqlite3.connect(DB_PATH) as conn:
+        canon = _resolve_canonical_name(conn, target_raw) or _normalize_tag(target_raw) or target_raw
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    start_30 = (now_ist - timedelta(days=29)).strftime("%Y-%m-%d")
+    rows_30 = await asyncio.to_thread(fetch_reports, None, start_30)
+    dates_30 = _dates_for_period(start_30, today_str)
+    st_30 = (await asyncio.to_thread(compute_member_stats_for_period, [canon], rows_30, dates_30, now_ist))[0]
+    today_rows = [r for r in rows_30 if r[4] == today_str]
+    st_today = (await asyncio.to_thread(compute_member_stats_for_period, [canon], today_rows, [today_str], now_ist))[0]
+    ledger_recent = await asyncio.to_thread(get_member_ledger_entries, canon, 5)
+
+    lines = [
+        f"💳 <b>Fine Card — {html.escape(canon)}</b>",
+        f"Today ({today_str}): Gross ₹{st_today['gross_pen']} | Balance Due: <b>₹{st_today['balance_due']}</b>",
+        f"Last 30 Days: Valid Join <b>{st_30['total_joining']}</b> | Late ₹{st_30['late_pen']} + Missed ₹{st_30['missed_pen']} = Gross <b>₹{st_30['gross_pen']}</b>",
+        f"Paid: <b>₹{st_30['paid_rs']}</b> | Waived: <b>₹{st_30['waived_rs']}</b>",
+        f"<b>Net Fine Balance Due: ₹{st_30['balance_due']}</b>",
+    ]
+    if ledger_recent:
+        lines.append("\n<b>Recent Payments / Waivers:</b>")
+        for etype, amt, note, edate in ledger_recent:
+            n_txt = f" ({html.escape(note)})" if note else ""
+            lines.append(f"- {edate}: {etype.upper()} ₹{amt}{n_txt}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def addworkgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can add work groups.")
+        return
+    if update.effective_chat.type == "private":
+        await update.message.reply_text("Run <code>/addworkgroup</code> inside the group you want to track.", parse_mode="HTML")
+        return
+    title = update.effective_chat.title or f"Group {update.effective_chat.id}"
+    await asyncio.to_thread(add_work_group, update.effective_chat.id, title)
+    await update.message.reply_text(
+        f"✅ Added <b>{html.escape(title)}</b> (<code>{update.effective_chat.id}</code>) to active Work Groups!",
+        parse_mode="HTML",
+    )
+
+
+async def removeworkgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can remove work groups.")
+        return
+    cid = int(context.args[0]) if (context.args and context.args[0].lstrip("-").isdigit()) else update.effective_chat.id
+    removed = await asyncio.to_thread(remove_work_group, cid)
+    await update.message.reply_text(
+        f"Removed work group <code>{cid}</code> from extra tracked groups."
+        if removed
+        else f"Group <code>{cid}</code> was not in tracked_chats.",
+        parse_mode="HTML",
+    )
+
+
+async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can view configured groups.")
+        return
+    wgroups = await asyncio.to_thread(get_tracked_work_groups)
+    excel_gid = get_excel_group_id()
+    lines = ["<b>Configured Groups:</b>"]
+    if wgroups:
+        for cid, ttl in wgroups:
+            lines.append(f"• Work: <b>{html.escape(ttl)}</b> (<code>{cid}</code>)")
+    else:
+        lines.append("• Work: Any group (none locked yet)")
+    lines.append(f"• Excel/DB Group: <code>{excel_gid or 'Not set'}</code>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -2980,6 +4572,7 @@ def _build_countdown_text(
             f"👏 Great discipline!"
         )
 
+    reg_pen, fin_pen, missed_pen = get_penalty_config()
     rem = max(0, remaining_secs)
     mins, secs = divmod(rem, 60)
     total = COUNTDOWN_DURATION_SECS
@@ -2998,37 +4591,194 @@ def _build_countdown_text(
                 f"⏱ Time Left Until 8:00 PM: <code>{mins:02d}:{secs:02d}</code>  <code>[{bar}]</code> <b>{pct}%</b>\n"
                 f"🕒 Deadline: <b>{html.escape(cutoff_str)}</b>\n\n"
                 f"🟢 Before 8:00 PM: <b>₹0 (On Time)</b>\n"
-                f"🟡 After 8:00 PM (Late): <b>₹{PENALTY_LATE_FINAL_RS} Penalty</b>\n"
-                f"🔴 Missed Report: <b>₹{PENALTY_MISSED_RS} Penalty</b>\n\n"
+                f"🟡 After 8:00 PM (Late): <b>₹{fin_pen} Penalty</b>\n"
+                f"🔴 Missed Report: <b>₹{missed_pen} Penalty</b>\n\n"
                 f"<b>Pending Assistants ({len(pending)}):</b>\n{tags_line}\n\n"
-                f"<i>Submit before 8:00 PM IST to avoid ₹10 / ₹15 penalty!</i>"
+                f"<i>Submit before 8:00 PM IST to avoid ₹{fin_pen} / ₹{missed_pen} penalty!</i>"
             )
         return (
             f"{anim} <b>15-MINUTE LATE COUNTDOWN</b> — {html.escape(slot_label)}\n\n"
             f"⏱ Time Remaining: <code>{mins:02d}:{secs:02d}</code>  <code>[{bar}]</code> <b>{pct}%</b>\n"
             f"🕒 Grace Cutoff: <b>{html.escape(cutoff_str)}</b>\n\n"
-            f"🟡 Late Submit (Timing ke baad bhi bhejein): <b>₹{PENALTY_LATE_REGULAR_RS} Penalty ONLY</b>\n"
-            f"🔴 Missed Slot (Nahi bheja toh): <b>₹{PENALTY_MISSED_RS} Penalty</b>\n\n"
+            f"🟡 Late Submit (Timing ke baad bhi bhejein): <b>₹{reg_pen} Penalty ONLY</b>\n"
+            f"🔴 Missed Slot (Nahi bheja toh): <b>₹{missed_pen} Penalty</b>\n\n"
             f"<b>Pending Assistants ({len(pending)}):</b>\n{tags_line}\n\n"
-            f"<i>Abhi submit karein (₹5 Late) warna ₹15 Missed penalty lagegi!</i>"
+            f"<i>Abhi submit karein (₹{reg_pen} Late) warna ₹{missed_pen} Missed penalty lagegi!</i>"
         )
 
     if is_final:
         return (
-            f"🚨💥 <b>8:00 PM LAST WARNING — ₹{PENALTY_LATE_FINAL_RS} PENALTY ACTIVE!</b>\n"
+            f"🚨💥 <b>8:00 PM LAST WARNING — ₹{fin_pen} PENALTY ACTIVE!</b>\n"
             f"Slot: <b>{html.escape(slot_label)}</b> ({today_str})\n\n"
             f"<code>[░░░░░░░░░░░░]</code> <b>0%</b>\n"
-            f"🟡 Submit Late Now: <b>₹{PENALTY_LATE_FINAL_RS} Penalty</b>\n"
-            f"🔴 If Missed Completely: <b>₹{PENALTY_MISSED_RS} Penalty</b>\n\n"
+            f"🟡 Submit Late Now: <b>₹{fin_pen} Penalty</b>\n"
+            f"🔴 If Missed Completely: <b>₹{missed_pen} Penalty</b>\n\n"
             f"<b>Still Pending ({len(pending)}):</b>\n{tags_line}"
         )
     return (
-        f"🚨💥 <b>COUNTDOWN ENDED (00:00) — ₹{PENALTY_MISSED_RS} MISSED PENALTY!</b>\n"
+        f"🚨💥 <b>COUNTDOWN ENDED (00:00) — ₹{missed_pen} MISSED PENALTY!</b>\n"
         f"Slot: <b>{html.escape(slot_label)}</b> ({today_str})\n\n"
         f"<code>[░░░░░░░░░░░░]</code> <b>0%</b>\n"
-        f"🔴 Unsubmitted reports are now <b>Missed (₹{PENALTY_MISSED_RS} Penalty)</b>. Late submit still saves you to <b>₹{PENALTY_LATE_REGULAR_RS}</b>.\n\n"
+        f"🔴 Unsubmitted reports are now <b>Missed (₹{missed_pen} Penalty)</b>. Late submit still saves you to <b>₹{reg_pen}</b>.\n\n"
         f"<b>Still Pending ({len(pending)}):</b>\n{tags_line}"
     )
+
+
+async def _cleanup_old_reminder_messages(bot, chat_id: int) -> None:
+    if not is_clean_chat_enabled():
+        return
+    key = f"clean_rem_msgs:{chat_id}"
+    raw = await asyncio.to_thread(get_setting, key, "[]")
+    try:
+        msg_ids = json.loads(raw or "[]")
+    except Exception:
+        msg_ids = []
+    if not isinstance(msg_ids, list) or not msg_ids:
+        return
+    for mid in msg_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=int(mid))
+        except Exception:
+            pass
+    await asyncio.to_thread(set_setting, key, "[]")
+
+
+async def _record_reminder_message(chat_id: int, message_id: int) -> None:
+    key = f"clean_rem_msgs:{chat_id}"
+    raw = await asyncio.to_thread(get_setting, key, "[]")
+    try:
+        msg_ids = json.loads(raw or "[]")
+        if not isinstance(msg_ids, list):
+            msg_ids = []
+    except Exception:
+        msg_ids = []
+    msg_ids.append(int(message_id))
+    await asyncio.to_thread(set_setting, key, json.dumps(msg_ids[-15:]))
+
+
+async def send_dm_to_assistant(
+    bot, uname: str, uid: Optional[int], html_text: str
+) -> tuple[bool, str]:
+    """
+    Strictly send Bot API DM ONLY to non-admin Assistants who have started the bot (/start).
+    Group Admins are always skipped.
+    """
+    if is_known_group_admin(uname, uid):
+        return False, "skipped_admin"
+
+    if uid is None:
+        return False, "needs_start_no_user_id"
+
+    try:
+        await bot.send_message(chat_id=uid, text=html_text, parse_mode="HTML")
+        await asyncio.to_thread(mark_user_dm_started, uid, uname)
+        return True, "bot_api"
+    except Exception as exc:
+        err_str = str(exc)
+        low = err_str.lower()
+        if "can't initiate conversation" in low or "bot was blocked" in low or "forbidden" in low:
+            return False, "needs_start"
+        return False, err_str
+
+
+async def _get_bot_username(bot) -> str:
+    global _BOT_USERNAME_CACHE
+    if _BOT_USERNAME_CACHE:
+        return _BOT_USERNAME_CACHE
+    try:
+        me = await bot.get_me()
+        if me and me.username:
+            _BOT_USERNAME_CACHE = me.username
+            return me.username
+    except Exception:
+        pass
+    return ""
+
+
+async def notify_pending_via_dm(
+    bot, slot_label: str, pending: list[tuple[str, Optional[int]]]
+) -> None:
+    """Send urgent personal DM via Bot API ONLY to pending non-admin assistants who have clicked /start."""
+    if not is_reminders_enabled():
+        return
+    reg_pen, fin_pen, missed_pen = get_penalty_config()
+    late_amt = fin_pen if _is_final_slot(slot_label) else reg_pen
+    for uname, uid in pending:
+        if is_known_group_admin(uname, uid):
+            continue
+        dm_text = (
+            f"⏰ <b>Urgent Report Reminder ({html.escape(slot_label)})</b>\n"
+            f"Hi {html.escape(uname)}, aapki report abhi pending hai!\n"
+            f"Abhi submit karne par Late Penalty <b>₹{late_amt}</b> hai (Miss hone par <b>₹{missed_pen}</b>)."
+        )
+        ok, via = await send_dm_to_assistant(bot, uname, uid, dm_text)
+        if not ok:
+            logger.debug("Assistant DM skipped for %s: %s", uname, via)
+        await asyncio.sleep(0.35)
+
+
+async def dmstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only admin can view assistant DM status.")
+        return
+    work_gid = get_work_group_id()
+    await refresh_group_admins(context.bot, work_gid, force=True)
+    tagged = await asyncio.to_thread(get_tagged_assistants_with_ids)
+    started_ids = await asyncio.to_thread(get_dm_started_user_ids)
+
+    non_admin_assistants = [(u, uid) for u, uid in tagged if not is_known_group_admin(u, uid)]
+    lines = [
+        "<b>Assistant DM Delivery Status (/start Only | Admins Strictly Excluded)</b>",
+        f"Active Non-Admin Assistants: <b>{len(non_admin_assistants)}</b>\n",
+    ]
+    for uname, uid in non_admin_assistants:
+        if uid is not None and uid in started_ids:
+            status = "✅ Bot DM Ready (/start done)"
+        else:
+            status = "⏳ Needs /start (Tap 1-Tap DM button in group countdown)"
+        lines.append(f"- {html.escape(uname)}: {status}")
+    if not non_admin_assistants:
+        lines.append("No active tagged non-admin assistants.")
+    lines.append("\nTest anytime: <code>/dmtest @assistant</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def dmtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only admin can test assistant DMs.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: <code>/dmtest @assistant [optional message]</code>", parse_mode="HTML")
+        return
+    raw_u = context.args[0]
+    custom_msg = " ".join(context.args[1:]).strip() or "🔔 Test Urgent Reminder: Report submission DM alerts active hain!"
+    with sqlite3.connect(DB_PATH) as conn:
+        canon = _resolve_canonical_name(conn, raw_u) or _normalize_tag(raw_u) or raw_u
+        row = conn.execute(
+            "SELECT user_id FROM assistant_tags WHERE LOWER(LTRIM(username, '@')) = ? UNION SELECT user_id FROM team_members WHERE LOWER(LTRIM(username, '@')) = ? LIMIT 1",
+            (_match_key(canon), _match_key(canon)),
+        ).fetchone()
+    uid = int(row[0]) if (row and row[0] is not None) else None
+    if is_known_group_admin(canon, uid):
+        await update.message.reply_text("🚫 Rejected: Ye user Group Admin hai — DM sirf non-admin Assistants ko jaata hai!")
+        return
+
+    ok, detail = await send_dm_to_assistant(context.bot, canon, uid, f"👋 Hi {html.escape(canon)},\n{html.escape(custom_msg)}")
+    if ok:
+        await update.message.reply_text(
+            f"✅ Test DM delivered to <code>{html.escape(canon)}</code> via <b>Bot API DM (/start)</b>!",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ Could not send DM to <code>{html.escape(canon)}</code>.\nReason: <code>{html.escape(detail)}</code>\n\n"
+            f"<i>Fix: Ask the assistant to open the bot and press <code>/start</code> (or tap 'Enable Personal DM Alerts' on the group countdown).</i>",
+            parse_mode="HTML",
+        )
 
 
 async def _run_countdown_animation(
@@ -3038,6 +4788,7 @@ async def _run_countdown_animation(
     slot_label: str,
     today_str: str,
     end_dt: datetime,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> None:
     key = (chat_id, slot_label)
     tick = 1
@@ -3059,6 +4810,7 @@ async def _run_countdown_animation(
                         chat_id=chat_id,
                         message_id=message_id,
                         text=text,
+                        reply_markup=None,
                         parse_mode="HTML",
                     )
                 except Exception:
@@ -3073,6 +4825,7 @@ async def _run_countdown_animation(
                     chat_id=chat_id,
                     message_id=message_id,
                     text=text,
+                    reply_markup=reply_markup,
                     parse_mode="HTML",
                 )
             except Exception as exc:
@@ -3099,6 +4852,7 @@ async def refresh_active_countdown(bot, chat_id: int, slot_label: str) -> bool:
     msg_id = int(state["message_id"])
     today_str = str(state["today_str"])
     end_dt = state["end_dt"]
+    reply_markup = state.get("reply_markup")
     if not isinstance(end_dt, datetime):
         return False
     remaining = max(0, int((end_dt - datetime.now(IST)).total_seconds()))
@@ -3119,6 +4873,7 @@ async def refresh_active_countdown(bot, chat_id: int, slot_label: str) -> bool:
             chat_id=chat_id,
             message_id=msg_id,
             text=text,
+            reply_markup=(None if not pending else reply_markup),
             parse_mode="HTML",
         )
     except Exception:
@@ -3132,11 +4887,14 @@ async def refresh_active_countdown(bot, chat_id: int, slot_label: str) -> bool:
 
 
 async def launch_penalty_countdown(
-    bot, chat_id: int, slot_label: str, force_even_if_empty: bool = False
+    bot, chat_id: int, slot_label: str, force_even_if_empty: bool = False, send_dm: bool = True
 ) -> bool:
     await refresh_group_admins(bot, chat_id, force=True)
     now_ist = datetime.now(IST)
     today_str = now_ist.strftime("%Y-%m-%d")
+    is_off, _ = is_date_holiday_or_off(today_str)
+    if is_off and not force_even_if_empty:
+        return False
     pending = await asyncio.to_thread(
         get_pending_tagged_assistants_for_slot, today_str, slot_label
     )
@@ -3144,7 +4902,7 @@ async def launch_penalty_countdown(
         if force_even_if_empty:
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"All tagged assistants have already submitted <b>{html.escape(slot_label)}</b> today!",
+                text=f"All active tagged assistants have already submitted <b>{html.escape(slot_label)}</b> today!",
                 parse_mode="HTML",
             )
         return False
@@ -3161,10 +4919,22 @@ async def launch_penalty_countdown(
     initial_text = _build_countdown_text(
         slot_label, today_str, initial_remaining, pending, tick=0, deadline_dt=end_dt
     )
+
+    dm_btn_markup: Optional[InlineKeyboardMarkup] = None
+    started_ids = await asyncio.to_thread(get_dm_started_user_ids)
+    needs_start = any((uid is None or uid not in started_ids) for _u, uid in pending)
+    if needs_start:
+        bot_uname = await _get_bot_username(bot)
+        if bot_uname:
+            dm_btn_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔔 Enable Personal DM Alerts (1-Tap)", url=f"https://t.me/{bot_uname}?start=dm_enable")]]
+            )
+
     try:
         sent = await bot.send_message(
-            chat_id=chat_id, text=initial_text, parse_mode="HTML"
+            chat_id=chat_id, text=initial_text, reply_markup=dm_btn_markup, parse_mode="HTML"
         )
+        await _record_reminder_message(chat_id, sent.message_id)
     except Exception as exc:
         logger.warning("Could not start penalty countdown in %s: %s", chat_id, exc)
         return False
@@ -3173,12 +4943,15 @@ async def launch_penalty_countdown(
         "message_id": sent.message_id,
         "end_dt": end_dt,
         "today_str": today_str,
+        "reply_markup": dm_btn_markup,
     }
     _COUNTDOWN_TASKS[key] = asyncio.create_task(
         _run_countdown_animation(
-            bot, chat_id, sent.message_id, slot_label, today_str, end_dt
+            bot, chat_id, sent.message_id, slot_label, today_str, end_dt, reply_markup=dm_btn_markup
         )
     )
+    if send_dm:
+        asyncio.create_task(notify_pending_via_dm(bot, slot_label, pending))
     return True
 
 
@@ -3208,17 +4981,103 @@ async def send_daily_excel_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def send_morning_kickoff_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """9:45 AM IST Morning Kickoff across all work groups."""
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    is_off, off_reason = is_date_holiday_or_off(today_str)
+    work_gids = get_all_work_group_ids()
+    if not work_gids:
+        return
+    reg_p, fin_p, miss_p = get_penalty_config()
+    tgt = get_daily_joining_target()
+    tgt_line = f"\n🎯 <b>Daily Joining Target:</b> {tgt}" if tgt > 0 else ""
+
+    for cid in work_gids:
+        await _cleanup_old_reminder_messages(context.bot, cid)
+        if is_off:
+            msg = f"🌴 <b>Good Morning Team! ({today_str})</b>\nToday is marked as <b>{html.escape(off_reason)}</b>. Slot reminders &amp; missed penalties are paused!"
+        else:
+            msg = (
+                f"☀️ <b>GOOD MORNING TEAM! ({today_str} IST)</b>\n"
+                f"Reporting schedule for today:\n"
+                f"• 10:00 AM | 1:00 PM | 3:00 PM | 5:00 PM (15 min grace)\n"
+                f"• Final Report: 7:15 PM – 8:00 PM IST (7:45 PM Countdown){tgt_line}\n\n"
+                f"⚖️ Penalties: Regular Late <b>₹{reg_p}</b> | Final Late <b>₹{fin_p}</b> | Missed <b>₹{miss_p}</b>\n"
+                f"<i>Note: Daily Joining counts your latest cumulative joining number!</i>"
+            )
+        try:
+            sent = await context.bot.send_message(chat_id=cid, text=msg, parse_mode="HTML")
+            await _record_reminder_message(cid, sent.message_id)
+        except Exception as exc:
+            logger.warning("Morning kickoff failed for %s: %s", cid, exc)
+
+
+async def send_daily_penalty_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """8:30 PM IST Auto Daily Penalty & Missed Summary."""
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    text = await asyncio.to_thread(_build_daily_penalty_text, today_str)
+    targets = get_all_work_group_ids() or ([DEFAULT_ADMIN_CHAT_ID] if DEFAULT_ADMIN_CHAT_ID else [])
+    for cid in targets:
+        try:
+            await context.bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
+        except Exception as exc:
+            logger.warning("Daily penalty summary failed for %s: %s", cid, exc)
+
+
+async def send_daily_leaderboard_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """8:45 PM IST Auto Daily Leaderboard."""
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    is_off, _ = is_date_holiday_or_off(today_str)
+    if is_off:
+        return
+    text = await asyncio.to_thread(_build_leaderboard_text, today_str)
+    for cid in get_all_work_group_ids():
+        try:
+            await context.bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
+        except Exception as exc:
+            logger.warning("Daily leaderboard failed for %s: %s", cid, exc)
+
+
+async def send_nightly_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """9:15 PM IST Silent .db + .xlsx Backup to Admin DM & Excel Group."""
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    if DEFAULT_ADMIN_CHAT_ID is not None and os.path.exists(DB_PATH):
+        try:
+            with open(DB_PATH, "rb") as f:
+                db_bytes = BytesIO(f.read())
+            db_bytes.name = "reports.db"
+            await context.bot.send_document(
+                chat_id=DEFAULT_ADMIN_CHAT_ID,
+                document=db_bytes,
+                filename=f"reports_{today_str}.db",
+                caption=f"Nightly SQLite Database Backup ({today_str} | 9:15 PM IST)",
+                disable_notification=True,
+            )
+        except Exception as exc:
+            logger.warning("Nightly DB backup to Admin DM failed: %s", exc)
+    await push_excel_to_group(
+        context,
+        target_date=today_str,
+        caption=f"Nightly Archived Excel Backup | {today_str} | 9:15 PM IST",
+    )
+
+
 async def send_slot_open_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_reminders_enabled() or not context.job:
         return
 
-    work_group_id = get_work_group_id()
-    if work_group_id is None:
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    is_off, _ = is_date_holiday_or_off(today_str)
+    if is_off:
         return
 
-    await refresh_group_admins(context.bot, work_group_id)
+    work_gids = get_all_work_group_ids()
+    if not work_gids:
+        return
+
     slot_label = str(context.job.data)
-    tagged_pairs = await asyncio.to_thread(get_tagged_assistants_with_ids)
+    reg_pen, fin_pen, missed_pen = get_penalty_config()
+    tagged_pairs = await asyncio.to_thread(get_pending_tagged_assistants_for_slot, today_str, slot_label)
     tags_line = " ".join(_format_mention_html(u, uid) for u, uid in tagged_pairs)
     attention_block = f"Attention: {tags_line}\n" if tags_line else ""
 
@@ -3227,92 +5086,110 @@ async def send_slot_open_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> Non
             f"<b>WARNING &amp; REMINDER:</b> {html.escape(slot_label)} is now OPEN (7:15 PM IST)!\n"
             f"{attention_block}"
             f"Submit your report (Username + Joining) before <b>8:00 PM IST</b> for <b>On Time (₹0)</b>.\n"
-            f"7:45 PM: Final Warning + 15-Min Countdown | After 8:00 PM: <b>₹{PENALTY_LATE_FINAL_RS} Late</b> | Missed: <b>₹{PENALTY_MISSED_RS}</b>."
+            f"7:45 PM: Final Warning + 15-Min Countdown | After 8:00 PM: <b>₹{fin_pen} Late</b> | Missed: <b>₹{missed_pen}</b>."
         )
     else:
         msg = (
             f"<b>WARNING &amp; REMINDER:</b> {html.escape(slot_label)} is now OPEN!\n"
             f"{attention_block}"
             f"Submit within 15 minutes for <b>On Time (₹0)</b>.\n"
-            f"After 15 mins (Late submit): <b>₹{PENALTY_LATE_REGULAR_RS} Penalty</b> | If Missed: <b>₹{PENALTY_MISSED_RS} Penalty</b>."
+            f"After 15 mins (Late submit): <b>₹{reg_pen} Penalty</b> | If Missed: <b>₹{missed_pen} Penalty</b>."
         )
 
-    try:
-        await context.bot.send_message(chat_id=work_group_id, text=msg, parse_mode="HTML")
-    except Exception as exc:
-        logger.warning("Could not send slot-open reminder to %s: %s", work_group_id, exc)
+    for work_group_id in work_gids:
+        await refresh_group_admins(context.bot, work_group_id)
+        await _cleanup_old_reminder_messages(context.bot, work_group_id)
+        try:
+            sent = await context.bot.send_message(chat_id=work_group_id, text=msg, parse_mode="HTML")
+            await _record_reminder_message(work_group_id, sent.message_id)
+        except Exception as exc:
+            logger.warning("Could not send slot-open reminder to %s: %s", work_group_id, exc)
 
 
 async def send_slot_final_warning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_reminders_enabled() or not context.job:
         return
 
-    work_group_id = get_work_group_id()
-    if work_group_id is None:
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    is_off, _ = is_date_holiday_or_off(today_str)
+    if is_off:
+        return
+
+    work_gids = get_all_work_group_ids()
+    if not work_gids:
         return
 
     slot_label = str(context.job.data)
     if _is_final_slot(slot_label):
-        # At 7:45 PM, send Final Warning WITH live 15-min countdown to 8:00 PM
-        await launch_penalty_countdown(context.bot, work_group_id, slot_label)
+        for wg_id in work_gids:
+            await launch_penalty_countdown(context.bot, wg_id, slot_label)
         return
 
-    await refresh_group_admins(context.bot, work_group_id)
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
     pending = await asyncio.to_thread(
         get_pending_tagged_assistants_for_slot, today_str, slot_label
     )
-
     if not pending:
         return
 
+    reg_pen, _fin_pen, missed_pen = get_penalty_config()
     tags_line = " ".join(_format_mention_html(u, uid) for u, uid in pending)
     msg = (
         f"<b>5 MINUTES LEFT (ON-TIME WINDOW)</b> — {html.escape(slot_label)}\n"
         f"Pending Assistants: {tags_line}\n"
-        f"Submit in 5 mins for ₹0! After 15 mins: Late = <b>₹{PENALTY_LATE_REGULAR_RS}</b> | Missed = <b>₹{PENALTY_MISSED_RS}</b>."
+        f"Submit in 5 mins for ₹0! After 15 mins: Late = <b>₹{reg_pen}</b> | Missed = <b>₹{missed_pen}</b>."
     )
-    try:
-        await context.bot.send_message(chat_id=work_group_id, text=msg, parse_mode="HTML")
-    except Exception as exc:
-        logger.warning("Could not send 5-min final warning to %s: %s", work_group_id, exc)
+    for work_group_id in work_gids:
+        await refresh_group_admins(context.bot, work_group_id)
+        try:
+            sent = await context.bot.send_message(chat_id=work_group_id, text=msg, parse_mode="HTML")
+            await _record_reminder_message(work_group_id, sent.message_id)
+        except Exception as exc:
+            logger.warning("Could not send 5-min final warning to %s: %s", work_group_id, exc)
 
 
 async def send_final_8pm_last_warning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fires at 8:00 PM IST to notify any remaining pending assistants that ₹10 Final Late Penalty is now active."""
+    """Fires at 8:00 PM IST to notify any remaining pending assistants that Final Late Penalty is now active."""
     if not is_reminders_enabled():
         return
-    work_group_id = get_work_group_id()
-    if work_group_id is None:
-        return
-    await refresh_group_admins(context.bot, work_group_id)
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    is_off, _ = is_date_holiday_or_off(today_str)
+    if is_off:
+        return
+    work_gids = get_all_work_group_ids()
+    if not work_gids:
+        return
     pending = await asyncio.to_thread(
         get_pending_tagged_assistants_for_slot, today_str, FINAL_SLOT_LABEL
     )
     if not pending:
         return
+    _reg_pen, fin_pen, missed_pen = get_penalty_config()
     tags_line = " ".join(_format_mention_html(u, uid) for u, uid in pending)
     msg = (
         f"🚨 <b>8:00 PM LAST WARNING — FINAL REPORT</b>\n"
         f"Pending Assistants: {tags_line}\n"
-        f"On-Time window closed! Submit late now for <b>₹{PENALTY_LATE_FINAL_RS} Penalty</b> — "
-        f"if missed, <b>₹{PENALTY_MISSED_RS} Penalty</b> applies."
+        f"On-Time window closed! Submit late now for <b>₹{fin_pen} Penalty</b> — "
+        f"if missed, <b>₹{missed_pen} Penalty</b> applies."
     )
-    try:
-        await context.bot.send_message(chat_id=work_group_id, text=msg, parse_mode="HTML")
-    except Exception as exc:
-        logger.warning("Could not send 8:00 PM last warning to %s: %s", work_group_id, exc)
+    for work_group_id in work_gids:
+        await refresh_group_admins(context.bot, work_group_id)
+        try:
+            sent = await context.bot.send_message(chat_id=work_group_id, text=msg, parse_mode="HTML")
+            await _record_reminder_message(work_group_id, sent.message_id)
+        except Exception as exc:
+            logger.warning("Could not send 8:00 PM last warning to %s: %s", work_group_id, exc)
 
 
 async def start_penalty_countdown_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_reminders_enabled() or not context.job:
         return
-    work_group_id = get_work_group_id()
-    if work_group_id is None:
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    is_off, _ = is_date_holiday_or_off(today_str)
+    if is_off:
         return
     slot_label = str(context.job.data)
-    await launch_penalty_countdown(context.bot, work_group_id, slot_label)
+    for wg_id in get_all_work_group_ids():
+        await launch_penalty_countdown(context.bot, wg_id, slot_label)
 
 
 async def countdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3474,12 +5351,11 @@ async def handle_any_group_message(update: Update, context: ContextTypes.DEFAULT
     if not message or not user or not chat or user.is_bot:
         return
 
-    work_group_id = get_work_group_id()
     excel_group_id = get_excel_group_id()
-    if excel_group_id is not None and chat.id == excel_group_id and excel_group_id != work_group_id:
+    if excel_group_id is not None and chat.id == excel_group_id and not is_allowed_work_group(chat.id):
         return
 
-    if work_group_id is not None and chat.id != work_group_id:
+    if not is_allowed_work_group(chat.id):
         return
 
     await refresh_group_admins(context.bot, chat.id)
@@ -3507,8 +5383,9 @@ async def handle_any_group_message(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Record Username, Joining, Timing, Caption & ₹0/₹5/₹15 Penalty for non-admin assistants
-    (supports new messages AND edited captions/messages). Random photos/admin posts are ignored.
+    Record Username, Joining, Timing, Caption & Penalty for non-admin assistants
+    (supports new messages AND edited captions/messages), with duplicate-photo detection,
+    zero-growth/drop alerts, cumulative daily joining, and one-tap late-report admin buttons.
     """
     is_edited = update.message is None and update.edited_message is not None
     message = update.message or update.edited_message
@@ -3518,7 +5395,6 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not message or not user or not chat or user.is_bot:
         return
 
-    # Skip backup archive uploads (.db/.sqlite/.xlsx) handled by backup handler
     if message.document:
         doc_name = (message.document.file_name or "").lower()
         if doc_name.endswith(".db") or doc_name.endswith(".sqlite") or doc_name.endswith(".xlsx"):
@@ -3526,26 +5402,23 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     raw_caption = (message.caption or message.text or "").strip()
 
-    # Ignore random photos, blank screenshots, leaderboards, and casual chats that are NOT a report format
     if not is_report_caption(raw_caption):
         return
 
     work_group_id = get_work_group_id()
     excel_group_id = get_excel_group_id()
-    if excel_group_id is not None and chat.id == excel_group_id and excel_group_id != work_group_id:
+    if excel_group_id is not None and chat.id == excel_group_id and not is_allowed_work_group(chat.id):
         return
 
-    if work_group_id is not None and chat.id != work_group_id:
-        logger.warning("Ignored report: chat_id=%s != work_group_id=%s", chat.id, work_group_id)
+    if not is_allowed_work_group(chat.id):
+        logger.warning("Ignored report: chat_id=%s not in allowed work groups", chat.id)
         now_ist = datetime.now(IST)
         last_warn = _MISMATCH_WARN_CACHE.get(chat.id)
         if last_warn is None or (now_ist - last_warn).total_seconds() >= 300:
             _MISMATCH_WARN_CACHE[chat.id] = now_ist
             await message.reply_text(
-                f"<b>Report not counted:</b> This group ID (<code>{chat.id}</code>) does not match "
-                f"configured Work Group (<code>{work_group_id}</code>).\n"
-                f"Admin: send <code>/setworkgroup</code> here right now, and set "
-                f"<code>ALLOWED_CHAT_ID={chat.id}</code> in Render.",
+                f"<b>Report not counted:</b> This group ID (<code>{chat.id}</code>) is not registered as a Work Group (primary: <code>{work_group_id}</code>).\n"
+                f"Admin: send <code>/addworkgroup</code> or <code>/setworkgroup</code> here right now.",
                 parse_mode="HTML",
                 reply_to_message_id=message.message_id,
             )
@@ -3583,6 +5456,7 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 pass
         return
 
+    growth_note = ""
     async with _REPORT_LOCK:
         if not is_edited and message.media_group_id:
             mg_key = f"{chat.id}:{message.media_group_id}"
@@ -3605,6 +5479,33 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 reply_to_message_id=message.message_id,
             )
             return
+
+        if message.photo:
+            photo_uid = message.photo[-1].file_unique_id
+            dup_photo = await asyncio.to_thread(
+                check_and_record_photo, photo_uid, username, report_date, active_slot, message.message_id
+            )
+            if dup_photo:
+                prev_u, prev_d, prev_s = dup_photo
+                await message.reply_text(
+                    f"⚠️ <b>Duplicate / Re-used Photo Detected!</b>\n"
+                    f"Ye photo pehle hi <code>{html.escape(prev_u)}</code> ne {prev_d} ({html.escape(prev_s)}) mein upload ki thi.\n"
+                    f"Please upload a fresh screenshot.",
+                    parse_mode="HTML",
+                    reply_to_message_id=message.message_id,
+                )
+                return
+
+        prev_join_info = await asyncio.to_thread(
+            get_previous_slot_joining_today, username, report_date, active_slot
+        )
+        new_join_int = _safe_int_joining(joining)
+        if prev_join_info and new_join_int is not None:
+            prev_slot_lbl, prev_val = prev_join_info
+            if new_join_int < prev_val:
+                growth_note = f"\n📉 <i>Alert: Joining dropped from {prev_val} ({html.escape(prev_slot_lbl)}) to {new_join_int} — please verify!</i>"
+            elif new_join_int == prev_val:
+                growth_note = f"\n⚠️ <i>Zero-Growth Note: Joining same as {html.escape(prev_slot_lbl)} ({new_join_int}).</i>"
 
         logger.info(
             "Slot report %s | user=%s | joining=%s | chat=%s | time=%s | slot=%s | status=%s | penalty=₹%s",
@@ -3632,6 +5533,8 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 message.date.isoformat(),
                 True,
                 penalty_rs,
+                chat.id,
+                message.message_id,
             )
         except Exception as exc:
             logger.exception("Failed to save report to database: %s", exc)
@@ -3660,7 +5563,7 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
         excel_caption += f"\nCaption: {raw_caption}"
     await push_excel_to_group(context, target_date=report_date, caption=excel_caption)
 
-    join_line = f"\nJoining: {joining}" if joining else ""
+    join_line = f"\nValid Joining Today: <b>{html.escape(joining)}</b>" if joining else ""
     label_verb = "Updated" if action == "updated" else "Recorded"
     if penalty_rs == 0:
         header_badge = f"🎉🔥💯 🏆 ✅ <b>Report {label_verb}!</b>"
@@ -3674,10 +5577,27 @@ async def handle_slot_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Assistant: <code>{html.escape(username)}</code>{join_line}\n"
         f"Slot: {html.escape(active_slot)}\n"
         f"Time: {html.escape(submission_time)} | {penalty_line}"
+        f"{growth_note}"
     )
+
+    reply_markup = None
+    if penalty_rs > 0:
+        rid = await asyncio.to_thread(get_report_row_id, username, report_date, active_slot)
+        if rid is not None:
+            reply_markup = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("✅ Mark On Time (₹0)", callback_data=f"late_ok:{rid}"),
+                        InlineKeyboardButton(f"🟡 Keep ₹{penalty_rs}", callback_data=f"late_keep:{rid}"),
+                        InlineKeyboardButton("🗑 Ignore", callback_data=f"late_del:{rid}"),
+                    ]
+                ]
+            )
+
     await message.reply_text(
         confirmation,
         parse_mode="HTML",
+        reply_markup=reply_markup,
         reply_to_message_id=message.message_id,
     )
 
@@ -3733,17 +5653,37 @@ async def auto_restore_from_excel_group(application: Application) -> None:
 
 async def post_init(application: Application) -> None:
     await auto_restore_from_excel_group(application)
-    work_gid = get_work_group_id()
-    if work_gid is not None:
-        await refresh_group_admins(application.bot, work_gid, force=True)
+    work_gids = get_all_work_group_ids()
+    for wg_id in work_gids:
+        await refresh_group_admins(application.bot, wg_id, force=True)
 
     if application.job_queue is None:
         return
 
     application.job_queue.run_daily(
+        send_morning_kickoff_job,
+        time=MORNING_KICKOFF_TIME_IST,
+        name="morning_kickoff",
+    )
+    application.job_queue.run_daily(
+        send_daily_penalty_summary_job,
+        time=DAILY_PENALTY_TIME_IST,
+        name="daily_penalty_summary",
+    )
+    application.job_queue.run_daily(
         send_daily_excel_job,
         time=DAILY_SEND_TIME_IST,
         name="daily_excel_report",
+    )
+    application.job_queue.run_daily(
+        send_daily_leaderboard_job,
+        time=DAILY_LEADERBOARD_TIME_IST,
+        name="daily_leaderboard",
+    )
+    application.job_queue.run_daily(
+        send_nightly_backup_job,
+        time=NIGHTLY_BACKUP_TIME_IST,
+        name="nightly_backup",
     )
 
     today_ist = datetime.now(IST).date()
@@ -3781,15 +5721,17 @@ async def post_init(application: Application) -> None:
                 name=f"penalty_countdown_{slot.label}",
             )
 
-    # If bot starts/restarts mid-window (e.g. 10:16–10:30 or 7:45–8:00 PM IST), resume active countdown immediately
-    if work_gid is not None and is_reminders_enabled():
+    if work_gids and is_reminders_enabled():
         now_ist = datetime.now(IST)
-        for slot in REPORTING_SLOTS:
-            if _get_slot_countdown_deadline(now_ist, slot.label) is not None:
-                await launch_penalty_countdown(application.bot, work_gid, slot.label)
+        is_off, _ = is_date_holiday_or_off(now_ist.strftime("%Y-%m-%d"))
+        if not is_off:
+            for wg_id in work_gids:
+                for slot in REPORTING_SLOTS:
+                    if _get_slot_countdown_deadline(now_ist, slot.label) is not None:
+                        await launch_penalty_countdown(application.bot, wg_id, slot.label)
 
     logger.info(
-        "Scheduled daily Excel (20:35 IST), Final 7:15/7:45 countdown + 8:00 PM warning, and ₹5/₹10/₹15 penalties."
+        "Scheduled Kickoff (9:45), Penalties (20:30), Excel (20:35), Leaderboard (20:45), Backup (21:15 IST), and 7:45/8:00 Final Countdown."
     )
 
 
@@ -3834,16 +5776,40 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(tags_callback_handler))
     application.add_handler(CommandHandler("reminder", reminder_command))
     application.add_handler(CommandHandler("setworkgroup", setworkgroup_command))
+    application.add_handler(CommandHandler("addworkgroup", addworkgroup_command))
+    application.add_handler(CommandHandler("removeworkgroup", removeworkgroup_command))
+    application.add_handler(CommandHandler("groups", groups_command))
     application.add_handler(CommandHandler(["setexcelgroup", "setdbgroup"], setexcelgroup_command))
     application.add_handler(CommandHandler(["excel", "report"], excel_command))
     application.add_handler(CommandHandler("weekly", weekly_command))
+    application.add_handler(CommandHandler("monthly", monthly_command))
+    application.add_handler(CommandHandler("payout", payout_command))
+    application.add_handler(CommandHandler("setrate", setrate_command))
     application.add_handler(CommandHandler("summary", summary_command))
+    application.add_handler(CommandHandler("leaderboard", leaderboard_command))
     application.add_handler(CommandHandler(["removesummary", "hidesummary"], removesummary_command))
     application.add_handler(CommandHandler(["restoresummary", "addsummary"], restoresummary_command))
     application.add_handler(CommandHandler("mystatus", mystatus_command))
+    application.add_handler(CommandHandler("myfine", myfine_command))
+    application.add_handler(CommandHandler("leave", leave_command))
+    application.add_handler(CommandHandler("unleave", unleave_command))
+    application.add_handler(CommandHandler("paid", paid_command))
+    application.add_handler(CommandHandler("waive", waive_command))
+    application.add_handler(CommandHandler("settarget", settarget_command))
+    application.add_handler(CommandHandler("alias", alias_command))
+    application.add_handler(CommandHandler("aliases", aliases_command))
+    application.add_handler(CommandHandler("holiday", holiday_command))
+    application.add_handler(CommandHandler("offdays", offdays_command))
+    application.add_handler(CommandHandler("cleanchat", cleanchat_command))
+    application.add_handler(CommandHandler("setpenalty", setpenalty_command))
+    application.add_handler(CommandHandler("setshift", setshift_command))
+    application.add_handler(CommandHandler("find", find_command))
+    application.add_handler(CommandHandler(["day", "date"], day_command))
     application.add_handler(CommandHandler("addmember", addmember_command))
     application.add_handler(CommandHandler("removemember", removemember_command))
     application.add_handler(CommandHandler("team", team_command))
+    application.add_handler(CommandHandler("dmstatus", dmstatus_command))
+    application.add_handler(CommandHandler("dmtest", dmtest_command))
     application.add_handler(CommandHandler(["restore", "recover"], restore_command))
 
     # Auto-restore when Admin forwards/sends .db or .xlsx in Database Group or Admin DM
