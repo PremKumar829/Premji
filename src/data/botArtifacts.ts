@@ -208,12 +208,12 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
   },
   {
     command: '/excel [YYYY-MM-DD]',
-    scope: 'Admin / Group',
+    scope: 'Admin Only',
     description: 'Generates and sends the 5-sheet .xlsx workbook (Regular Late ₹5, Final Late ₹10, Missed ₹15 columns) for today or a specific date.',
   },
   {
     command: '/weekly & /monthly [YYYY-MM]',
-    scope: 'Admin / Group',
+    scope: 'Admin Only',
     description: 'Sends 7-day or monthly consolidated Excel workbooks summing Valid Daily Joining across days (no double-counting within the same day) + penalties & balance due.',
   },
   {
@@ -222,9 +222,19 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
     description: 'Generates a net payout Excel sheet: (Valid Joinings × Rate) - Unpaid/Unwaived Fines.',
   },
   {
-    command: '/summary, /leaderboard, /mystatus & /myfine',
-    scope: 'Group / DM',
-    description: 'Shows Valid Daily Joining (latest slot value per day), Daily Target diff, Ranked Leaderboard (auto 8:45 PM), Fine Card, and interactive name manager.',
+    command: '/allfines [today|7|30] (or /fines)',
+    scope: 'Admin Only',
+    description: 'Shows ALL assistants\' penalties together in one view (Today + Period Late/Missed/Paid/Waived/Net Due) with period switcher buttons, 1-tap Mark All Paid (₹0), & Reset All Fines.',
+  },
+  {
+    command: '/summary & /leaderboard',
+    scope: 'Admin Only',
+    description: 'Shows team Valid Daily Joining (latest slot value per day), Daily Target diff, Ranked Leaderboard (auto 8:45 PM), and interactive name manager.',
+  },
+  {
+    command: '/start, /mystatus, /myfine, /myrank & /myhelp',
+    scope: 'Assistants Only',
+    description: 'Dedicated personal commands for Assistants: activate DM alerts, view own valid daily joining, own fine card, and own rank without accessing admin/teammate data.',
   },
   {
     command: '/leave & /unleave',
@@ -232,9 +242,9 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
     description: '/leave @user [today|YYYY-MM-DD] [slot|full] — Exempts assistant from reminders and missed penalties for a slot or full day.',
   },
   {
-    command: '/paid @user <amt> & /waive @user <amt>',
+    command: '/paid all (or /paidall), /paid @user <amt|all> & /waive all',
     scope: 'Admin Only',
-    description: 'Tracks fine payments and waivers in the ledger so Balance Due updates accurately across summaries and Excel.',
+    description: 'Tracks fine payments & waivers for one assistant or all assistants at once (/paid all or /paidall sets everyone\'s Net Balance Due to ₹0 while keeping Paid ledger history accurate).',
   },
   {
     command: '/setshift @user morning|evening|full & /settarget <N>',
@@ -258,7 +268,7 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
   },
   {
     command: '/find @user [days] & /day [YYYY-MM-DD]',
-    scope: 'Group / DM',
+    scope: 'Admin Only',
     description: 'Searches any assistant history across N days or pulls a full daily snapshot for any past date.',
   },
   {

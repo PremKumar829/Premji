@@ -36,7 +36,15 @@ from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 try:
     from telegram import ReactionTypeEmoji
 except ImportError:
@@ -3020,9 +3028,25 @@ def _build_summary_manage_panel(today_str: str) -> tuple[str, InlineKeyboardMark
 # Authorization Helper
 # ---------------------------------------------------------------------------
 def _is_admin(update: Update) -> bool:
-    if DEFAULT_ADMIN_CHAT_ID is None or not update.effective_user:
+    if not update.effective_user:
+        return False
+    if DEFAULT_ADMIN_CHAT_ID is not None:
+        return update.effective_user.id == DEFAULT_ADMIN_CHAT_ID
+    uname = f"@{update.effective_user.username}" if update.effective_user.username else ""
+    return is_known_group_admin(uname, update.effective_user.id)
+
+
+async def _require_admin(update: Update) -> bool:
+    if _is_admin(update):
         return True
-    return update.effective_user.id == DEFAULT_ADMIN_CHAT_ID
+    if update.message:
+        await update.message.reply_text(
+            "⛔ <b>Restricted Command</b>\n"
+            "Ye command sirf <b>Admin</b> ke liye hai.\n\n"
+            "Assistants ke liye alag commands hain: /myhelp",
+            parse_mode="HTML",
+        )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -3089,6 +3113,37 @@ def get_dm_started_profiles() -> dict[int, str]:
     return out
 
 
+def _assistant_commands_text(uname: str, dm_activated: bool = False) -> str:
+    header = (
+        f"✅ <b>Personal DM Alerts Activated!</b>\n\n"
+        f"Hi <b>{html.escape(uname)}</b>, ab aapko slot deadlines aur 15-min countdown ke urgent alerts direct DM mein milenge.\n\n"
+        if dm_activated
+        else f"👋 <b>Assistant Command Guide ({html.escape(uname)})</b>\n\n"
+    )
+    return (
+        f"{header}"
+        f"<b>Assistants Ke Liye Commands:</b>\n"
+        f"/start — Personal DM Alerts activate karein\n"
+        f"/mystatus — Aaj ki valid joining, slots &amp; aaj ki penalty dekhein\n"
+        f"/myfine — Apna fine balance &amp; payment history dekhein\n"
+        f"/myrank — Aaj ki apni rank aur on-time score dekhein\n"
+        f"/myhelp — Ye assistant guide wapas dekhein\n\n"
+        f"<b>Report Bhejne Ka Format (Work Group Mein):</b>\n"
+        f"<code>Username : @AapkaUsername</code>\n"
+        f"<code>Joining : 45</code> (ya <code>Total Joining 45</code>)"
+    )
+
+
+async def myhelp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    user = update.effective_user
+    uname = f"@{user.username}" if user.username else (user.first_name or "Assistant")
+    if update.effective_chat and update.effective_chat.type == "private":
+        await asyncio.to_thread(mark_user_dm_started, user.id, uname)
+    await update.message.reply_text(_assistant_commands_text(uname, dm_activated=False), parse_mode="HTML")
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or not update.effective_user:
         return
@@ -3097,19 +3152,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     uname = f"@{user.username}" if user.username else (user.first_name or "Assistant")
     if update.effective_chat.type == "private":
         await asyncio.to_thread(mark_user_dm_started, user.id, uname)
-        if not _is_admin(update) and not is_known_group_admin(uname, user.id):
+
+    if not _is_admin(update):
+        if not is_known_group_admin(uname, user.id):
             await asyncio.to_thread(auto_discover_assistant, uname, user.id)
-            await update.message.reply_text(
-                f"✅ <b>Personal DM Alerts Activated!</b>\n\n"
-                f"Hi <b>{html.escape(uname)}</b>, ab aapko slot deadlines aur 15-min penalty countdown ke urgent alerts direct DM mein milenge.\n\n"
-                f"<b>Useful Commands:</b>\n"
-                f"/mystatus — Aaj ki valid joining, slots &amp; penalty dekhein\n"
-                f"/myfine — Apna fine balance &amp; payment history dekhein\n"
-                f"/summary — Aaj ki team summary\n"
-                f"/leaderboard — Aaj ke top performers",
-                parse_mode="HTML",
-            )
-            return
+        dm_on = update.effective_chat.type == "private"
+        await update.message.reply_text(_assistant_commands_text(uname, dm_activated=dm_on), parse_mode="HTML")
+        return
 
     rem_status = "ON" if is_reminders_enabled() else "OFF"
     clean_status = "ON" if is_clean_chat_enabled() else "OFF"
@@ -3121,35 +3170,40 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     reg_p, fin_p, miss_p = get_penalty_config()
 
     await update.message.reply_text(
-        f"<b>Excel Report Tracker Bot is active.</b>\n"
+        f"<b>Excel Report Tracker Bot (Admin Panel)</b>\n"
         f"Your User ID (<code>ADMIN_CHAT_ID</code>): <code>{update.effective_user.id}</code>\n"
         f"Current Chat ID: <code>{update.effective_chat.id}</code>\n"
         f"Work Group(s): <code>{work_gid_str}</code> | Excel Group: <code>{excel_gid}</code>\n"
         f"Reminders: <b>{rem_status}</b> | Clean Chat: <b>{clean_status}</b> | Tagged: <b>{tagged_count}</b>\n"
-        f"Assistant DM Mode: <b>Bot API Only (/start required | {dm_started_count} active, Admins Excluded)</b>\n"
+        f"Assistant DM Mode: <b>Bot API (/start Only | {dm_started_count} active, Admins Excluded)</b>\n"
         f"Penalties: Regular ₹{reg_p} | Final ₹{fin_p} | Missed ₹{miss_p}\n\n"
-        f"<b>Daily Tracking &amp; Excel Reports:</b>\n"
+        f"<b>All-Team Reports &amp; Fines (Admin Only):</b>\n"
+        f"/allfines [days|today] — Ek saath sabhi assistants ki penalty\n"
+        f"/paidall (ya /paid all) — Sabhi ke pending fines Paid mark karke ₹0 karein\n"
+        f"/paid @user &lt;amt|all&gt; | /waive all | /waive @user &lt;amt|all&gt;\n"
+        f"/resetfine [@user|all] — Sabhi/ek assistant ke fines ₹0 reset karein\n"
         f"/excel [YYYY-MM-DD] | /weekly | /monthly [YYYY-MM] | /payout [days] [rate]\n"
-        f"/summary | /leaderboard | /mystatus | /myfine [@user]\n"
-        f"/find @user [days] | /day [YYYY-MM-DD]\n\n"
+        f"/summary | /leaderboard | /find @user [days] | /day [YYYY-MM-DD]\n\n"
         f"<b>Assistant DM Alerts (/start Only — Admins Excluded):</b>\n"
         f"/dmstatus | /dmtest @assistant | /dmall [message]\n\n"
         f"<b>Admin Controls &amp; Backfill:</b>\n"
         f"/add (reply) | /addreport @user 40 [10am]\n"
         f"/tags | /settags @a @b | /addtag | /removetag | /cleartags\n"
         f"/reminder on|off | /cleanchat on|off | /countdown [slot|stop]\n"
-        f"/leave @user [date] [slot] | /unleave @user [date]\n"
-        f"/paid @user amt | /waive @user amt | /resetfine [@user|all] | /setshift @user morning|evening|full\n"
+        f"/leave @user [date] [slot] | /unleave @user [date] | /setshift @user morning|evening|full\n"
         f"/settarget N | /setrate Rs | /setpenalty regular 5 final 10 missed 15\n"
         f"/holiday on|off | /offdays sun|sat,sun|none | /alias @old @new | /aliases\n"
         f"/removesummary @a | /restoresummary @a | /restore\n"
-        f"/setworkgroup | /addworkgroup | /removeworkgroup | /groups | /setexcelgroup | /check",
+        f"/setworkgroup | /addworkgroup | /removeworkgroup | /groups | /setexcelgroup | /check\n\n"
+        f"<i>Assistant Commands: /start, /mystatus, /myfine, /myrank, /myhelp</i>",
         parse_mode="HTML",
     )
 
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if not await _require_admin(update):
         return
     chat = update.effective_chat
     work_gids = get_all_work_group_ids()
@@ -3407,6 +3461,9 @@ async def addreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await myhelp_command(update, context)
+        return
     await start_command(update, context)
 
 
@@ -3615,6 +3672,85 @@ async def tags_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "tag_clear":
         await asyncio.to_thread(clear_assistant_tags)
         await query.answer("Cleared all assistant tags")
+    elif data.startswith("allfines_days:"):
+        days_val = max(1, min(90, _safe_int(data.split(":", 1)[1]) or 30))
+        await query.answer(f"Showing {days_val}-day team fines")
+        text, markup = await asyncio.to_thread(_build_all_fines_view, days_val)
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup, parse_mode="HTML")
+        except Exception:
+            pass
+        return
+    elif data.startswith("allfines_paid_ask:"):
+        days_val = max(1, min(90, _safe_int(data.split(":", 1)[1]) or 30))
+        await query.answer("Confirm mark all paid?")
+        confirm_markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ Confirm Mark All Paid (₹0)", callback_data=f"allfines_paid_do:{days_val}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"allfines_days:{days_val}"),
+                ]
+            ]
+        )
+        try:
+            await query.edit_message_reply_markup(reply_markup=confirm_markup)
+        except Exception:
+            pass
+        return
+    elif data.startswith("allfines_paid_do:"):
+        days_val = max(1, min(90, _safe_int(data.split(":", 1)[1]) or 30))
+        settled, total_cleared = await asyncio.to_thread(
+            _bulk_settle_all_fines, "paid", "Bulk paid via /allfines"
+        )
+        if settled:
+            await query.answer(f"Marked ₹{total_cleared} Paid for {len(settled)} assistant(s)!")
+        else:
+            await query.answer("Sabhi assistants ka balance pehle se hi ₹0 hai!")
+        text, markup = await asyncio.to_thread(_build_all_fines_view, days_val)
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup, parse_mode="HTML")
+        except Exception:
+            pass
+        return
+    elif data.startswith("allfines_reset_ask:"):
+        days_val = max(1, min(90, _safe_int(data.split(":", 1)[1]) or 30))
+        await query.answer("Confirm reset?")
+        confirm_markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ Confirm Zero All Fines (₹0)", callback_data=f"allfines_reset_do:{days_val}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"allfines_days:{days_val}"),
+                ]
+            ]
+        )
+        try:
+            await query.edit_message_reply_markup(reply_markup=confirm_markup)
+        except Exception:
+            pass
+        return
+    elif data.startswith("allfines_reset_do:"):
+        days_val = max(1, min(90, _safe_int(data.split(":", 1)[1]) or 30))
+        now_ist = datetime.now(IST)
+        today_r = now_ist.strftime("%Y-%m-%d")
+        now_secs = _time_to_secs(now_ist.time().replace(tzinfo=None))
+
+        def _do_reset_all() -> None:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE reports SET penalty_rs = 0 WHERE penalty_rs != 0")
+                conn.execute("DELETE FROM penalty_ledger")
+                conn.commit()
+            set_setting("fine_reset_date", today_r)
+            set_setting("fine_reset_time_secs", str(now_secs))
+            set_setting("member_fine_reset_dates", "{}")
+
+        await asyncio.to_thread(_do_reset_all)
+        await query.answer("All team fines reset to ₹0!")
+        text, markup = await asyncio.to_thread(_build_all_fines_view, days_val)
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup, parse_mode="HTML")
+        except Exception:
+            pass
+        return
     else:
         await query.answer()
         return
@@ -3630,6 +3766,8 @@ async def tags_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
 async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if not await _require_admin(update):
+        return
 
     if not context.args:
         status = "ON" if is_reminders_enabled() else "OFF"
@@ -3641,10 +3779,6 @@ async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"Use <code>/reminder on</code>, <code>/reminder off</code>, or <code>/tags</code>.",
             parse_mode="HTML",
         )
-        return
-
-    if not _is_admin(update):
-        await update.message.reply_text("Only the configured admin can turn reminders ON or OFF.")
         return
 
     arg = context.args[0].strip().lower()
@@ -3708,9 +3842,7 @@ async def setexcelgroup_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def excel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
-
-    if update.effective_chat.type == "private" and not _is_admin(update):
-        await update.message.reply_text("Unauthorized: Only the configured admin can fetch reports.")
+    if not await _require_admin(update):
         return
 
     target_date = datetime.now(IST).strftime("%Y-%m-%d")
@@ -3738,9 +3870,7 @@ async def excel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
-
-    if update.effective_chat.type == "private" and not _is_admin(update):
-        await update.message.reply_text("Unauthorized: Only the configured admin can fetch reports.")
+    if not await _require_admin(update):
         return
 
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -3756,6 +3886,8 @@ async def weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
+        return
+    if not await _require_admin(update):
         return
 
     sync_cid = (
@@ -3965,30 +4097,133 @@ async def unleave_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+def _bulk_settle_all_fines(
+    entry_type: str, note: str = "", now_ist: Optional[datetime] = None
+) -> tuple[list[tuple[str, int]], int]:
+    """Record Paid or Waived entries for all non-admin assistants whose net balance_due > 0."""
+    now_ist = now_ist or datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    start_30 = (now_ist - timedelta(days=29)).strftime("%Y-%m-%d")
+    rows_30 = fetch_reports(None, start_30)
+    dates_30 = _dates_for_period(start_30, today_str)
+
+    _admin_ids, admin_keys = get_known_admin_sets()
+    members = [
+        m
+        for m in _dedup_case_insensitive(
+            get_team_members() + get_tagged_assistants() + [r[0] for r in rows_30]
+        )
+        if _match_key(m) not in admin_keys
+    ]
+    if not members:
+        return [], 0
+
+    stats = compute_member_stats_for_period(members, rows_30, dates_30, now_ist)
+    settled: list[tuple[str, int]] = []
+    total_cleared = 0
+    clean_note = note.strip() or f"Bulk {entry_type} all"
+    for st in stats:
+        due_amt = int(st["balance_due"])
+        if due_amt > 0:
+            canon = add_penalty_ledger_entry(
+                str(st["member"]), entry_type, due_amt, clean_note, today_str
+            )
+            settled.append((canon, due_amt))
+            total_cleared += due_amt
+    return settled, total_cleared
+
+
 async def _handle_ledger_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, entry_type: str
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    entry_type: str,
+    force_all: bool = False,
 ) -> None:
     if not update.message:
         return
-    if not _is_admin(update):
-        await update.message.reply_text("Only the configured admin can update penalty payments/waivers.")
+    if not await _require_admin(update):
         return
-    if len(context.args) < 2 or not context.args[1].lstrip("₹").isdigit():
+
+    is_bulk_all = force_all or (
+        bool(context.args)
+        and context.args[0].strip().lower() in ("all", "*", "team", "everyone")
+    )
+
+    if is_bulk_all:
+        note_args = list(context.args or [])
+        if not force_all and note_args:
+            note_args = note_args[1:]
+        if note_args and note_args[0].strip().lower() == "all":
+            note_args = note_args[1:]
+        note = " ".join(note_args).strip()
+
+        now_ist = datetime.now(IST)
+        settled, total_cleared = await asyncio.to_thread(
+            _bulk_settle_all_fines, entry_type, note, now_ist
+        )
+        if not settled:
+            await update.message.reply_text(
+                "ℹ️ Sabhi assistants ka net fine balance pehle se hi <b>₹0</b> hai.",
+                parse_mode="HTML",
+            )
+            return
+
+        verb = "All Pending Fines Marked PAID" if entry_type == "paid" else "All Pending Fines WAIVED"
+        lines = [
+            f"💳 <b>{verb}</b>",
+            f"Assistants Cleared: <b>{len(settled)}</b> | Total Cleared: <b>₹{total_cleared}</b>",
+            "",
+        ]
+        for idx, (canon, amt_val) in enumerate(settled[:30], start=1):
+            lines.append(f"{idx}. <code>{html.escape(canon)}</code> — <b>₹{amt_val}</b>")
+        if len(settled) > 30:
+            lines.append(f"...and {len(settled) - 30} more")
+        lines.append("\n✅ <i>Sabhi assistants ka Net Fine Balance Due ab ₹0 hai!</i>")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    if len(context.args) < 2:
         await update.message.reply_text(
-            f"Usage: <code>/{entry_type} @username 15 [optional note]</code>", parse_mode="HTML"
+            f"Usage:\n"
+            f"• Single assistant: <code>/{entry_type} @username &lt;amount|all&gt; [note]</code>\n"
+            f"• Sabhi assistants ek saath: <code>/{entry_type} all [note]</code> ya <code>/{entry_type}all</code>",
+            parse_mode="HTML",
         )
         return
     raw_user = context.args[0]
-    amt = int(context.args[1].lstrip("₹"))
-    note = " ".join(context.args[2:]).strip()
-    today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    canon = await asyncio.to_thread(add_penalty_ledger_entry, raw_user, entry_type, amt, note, today_str)
+    amt_tok = context.args[1].strip().lstrip("₹")
+    if not (amt_tok.isdigit() or amt_tok.lower() == "all"):
+        await update.message.reply_text(
+            f"Usage:\n"
+            f"• Single assistant: <code>/{entry_type} @username &lt;amount|all&gt; [note]</code>\n"
+            f"• Sabhi assistants ek saath: <code>/{entry_type} all [note]</code> ya <code>/{entry_type}all</code>",
+            parse_mode="HTML",
+        )
+        return
 
-    # Calculate 30-day running balance due
-    start_30 = (datetime.now(IST) - timedelta(days=29)).strftime("%Y-%m-%d")
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    start_30 = (now_ist - timedelta(days=29)).strftime("%Y-%m-%d")
     rows_30 = await asyncio.to_thread(fetch_reports, None, start_30)
     dates_30 = _dates_for_period(start_30, today_str)
-    st = (await asyncio.to_thread(compute_member_stats_for_period, [canon], rows_30, dates_30))[0]
+    with sqlite3.connect(DB_PATH) as conn:
+        canon_lookup = _resolve_canonical_name(conn, raw_user) or _normalize_tag(raw_user) or raw_user
+
+    if amt_tok.lower() == "all":
+        cur_st = (await asyncio.to_thread(compute_member_stats_for_period, [canon_lookup], rows_30, dates_30, now_ist))[0]
+        amt = int(cur_st["balance_due"])
+        if amt <= 0:
+            await update.message.reply_text(
+                f"ℹ️ <code>{html.escape(canon_lookup)}</code> ka balance pehle se hi <b>₹0</b> hai.",
+                parse_mode="HTML",
+            )
+            return
+    else:
+        amt = int(amt_tok)
+
+    note = " ".join(context.args[2:]).strip()
+    canon = await asyncio.to_thread(add_penalty_ledger_entry, canon_lookup, entry_type, amt, note, today_str)
+    st = (await asyncio.to_thread(compute_member_stats_for_period, [canon], rows_30, dates_30, now_ist))[0]
     verb = "Payment Recorded" if entry_type == "paid" else "Fine Waived"
     await update.message.reply_text(
         f"💳 <b>{verb}</b>\n"
@@ -4003,8 +4238,16 @@ async def paid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _handle_ledger_command(update, context, "paid")
 
 
+async def paidall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_ledger_command(update, context, "paid", force_all=True)
+
+
 async def waive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_ledger_command(update, context, "waive")
+
+
+async def waiveall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_ledger_command(update, context, "waive", force_all=True)
 
 
 async def resetfine_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4070,8 +4313,176 @@ async def resetfine_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
+def _build_all_fines_view(days: int = 30) -> tuple[str, InlineKeyboardMarkup]:
+    """Consolidated all-assistants penalty sheet (Today + Period Late/Missed/Paid/Waived/Net Due)."""
+    days = max(1, min(90, int(days)))
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    start_str = (now_ist - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    period_rows = fetch_reports(None, start_str)
+    today_rows = [r for r in period_rows if r[4] == today_str]
+    date_list = _dates_for_period(start_str, today_str)
+
+    _admin_ids, admin_keys = get_known_admin_sets()
+    members = [
+        m
+        for m in _dedup_case_insensitive(
+            get_team_members() + get_tagged_assistants() + [r[0] for r in period_rows]
+        )
+        if _match_key(m) not in admin_keys
+    ]
+
+    reg_p, fin_p, miss_p = get_penalty_config()
+    if not members:
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔄 Refresh", callback_data=f"allfines_days:{days}")]]
+        )
+        return (
+            f"💳 <b>All Assistants Penalty Report ({'Today' if days == 1 else f'Last {days} Days'})</b>\n"
+            f"Abhi koi non-admin assistant record nahi mila.",
+            markup,
+        )
+
+    period_stats = compute_member_stats_for_period(members, period_rows, date_list, now_ist)
+    today_stats = compute_member_stats_for_period(members, today_rows, [today_str], now_ist)
+    today_by_key = {str(s["key"]): s for s in today_stats}
+
+    total_due = sum(int(s["balance_due"]) for s in period_stats)
+    total_gross = sum(int(s["gross_pen"]) for s in period_stats)
+    total_late = sum(int(s["late_pen"]) for s in period_stats)
+    total_missed = sum(int(s["missed_pen"]) for s in period_stats)
+    total_paid = sum(int(s["paid_rs"]) for s in period_stats)
+    total_waived = sum(int(s["waived_rs"]) for s in period_stats)
+    total_today_gross = sum(int(today_by_key[str(s["key"])]["gross_pen"]) for s in period_stats if str(s["key"]) in today_by_key)
+
+    sorted_stats = sorted(
+        period_stats,
+        key=lambda s: (
+            int(s["balance_due"]),
+            int(today_by_key.get(str(s["key"]), {}).get("gross_pen", 0)),
+            int(s["gross_pen"]),
+            -int(s["total_joining"]),
+        ),
+        reverse=True,
+    )
+
+    fined_rows = [
+        s for s in sorted_stats
+        if int(s["balance_due"]) > 0 or int(s["gross_pen"]) > 0 or int(s["paid_rs"]) > 0 or int(s["waived_rs"]) > 0
+    ]
+    clean_names = [
+        str(s["member"]) for s in sorted_stats
+        if int(s["balance_due"]) == 0 and int(s["gross_pen"]) == 0 and int(s["paid_rs"]) == 0 and int(s["waived_rs"]) == 0
+    ]
+
+    period_lbl = f"Today ({today_str})" if days == 1 else f"Last {days} Days (to {today_str})"
+    lines = [
+        f"💳 <b>All Assistants Penalty Report — {period_lbl}</b>",
+        f"Total Net Balance Due: <b>₹{total_due}</b> | Today Gross: <b>₹{total_today_gross}</b>",
+        f"Gross: ₹{total_gross} (Late ₹{total_late} + Missed ₹{total_missed}) | Paid: ₹{total_paid} | Waived: ₹{total_waived}",
+        f"<i>Rates: Reg ₹{reg_p} | Final ₹{fin_p} | Missed ₹{miss_p}</i>",
+        "",
+    ]
+
+    if fined_rows:
+        for idx, s in enumerate(fined_rows[:35], start=1):
+            t_st = today_by_key.get(str(s["key"]), {})
+            t_due = int(t_st.get("balance_due", 0))
+            late_cnt = int(s["late_regular"]) + int(s["late_final"])
+            miss_cnt = int(s["missed"])
+            adj_bits = []
+            if int(s["paid_rs"]) > 0:
+                adj_bits.append(f"Paid ₹{s['paid_rs']}")
+            if int(s["waived_rs"]) > 0:
+                adj_bits.append(f"Waived ₹{s['waived_rs']}")
+            adj_txt = f" | {', '.join(adj_bits)}" if adj_bits else ""
+            lines.append(
+                f"{idx}. {html.escape(str(s['member']))} — Due: <b>₹{s['balance_due']}</b> "
+                f"(Today ₹{t_due} | {late_cnt}L ₹{s['late_pen']} + {miss_cnt}M ₹{s['missed_pen']}{adj_txt})"
+            )
+    else:
+        lines.append("🎉 <b>Zero Pending Fines!</b> Sabhi assistants ka balance ₹0 hai.")
+
+    if clean_names:
+        shown_clean = ", ".join(html.escape(n) for n in clean_names[:15])
+        extra_cnt = f" +{len(clean_names) - 15} more" if len(clean_names) > 15 else ""
+        lines.append(f"\n✅ <b>Zero-Fine ({len(clean_names)}):</b> {shown_clean}{extra_cnt}")
+
+    lines.append("\n<i>Settle: /paid all (ya /paidall) | /paid @user all | /waive all | /resetfine [@user|all]</i>")
+
+    markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("• Today •" if days == 1 else "Today", callback_data="allfines_days:1"),
+                InlineKeyboardButton("• 7 Days •" if days == 7 else "7 Days", callback_data="allfines_days:7"),
+                InlineKeyboardButton("• 30 Days •" if days == 30 else "30 Days", callback_data="allfines_days:30"),
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"allfines_days:{days}"),
+            ],
+            [
+                InlineKeyboardButton("💳 Mark All Paid (₹0)", callback_data=f"allfines_paid_ask:{days}"),
+                InlineKeyboardButton("🧹 Reset All Fines to ₹0", callback_data=f"allfines_reset_ask:{days}"),
+            ],
+        ]
+    )
+    return "\n".join(lines), markup
+
+
+async def allfines_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /allfines [today|7|30] — show all assistants' penalties together."""
+    if not update.message:
+        return
+    if not await _require_admin(update):
+        return
+    days = 30
+    if context.args:
+        arg = context.args[0].strip().lower()
+        if arg in ("today", "1", "1d"):
+            days = 1
+        elif arg.rstrip("d").isdigit():
+            days = max(1, min(90, int(arg.rstrip("d"))))
+    text, markup = await asyncio.to_thread(_build_all_fines_view, days)
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def myrank_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dedicated Assistant command: shows ONLY the caller's own rank, today's valid joining, and on-time score."""
+    if not update.message or not update.effective_user:
+        return
+    user = update.effective_user
+    self_raw = f"@{user.username}" if user.username else (user.first_name or "Assistant")
+    with sqlite3.connect(DB_PATH) as conn:
+        canon = _resolve_canonical_name(conn, self_raw) or _normalize_tag(self_raw) or self_raw
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    rows = await asyncio.to_thread(fetch_reports, today_str)
+    members = await asyncio.to_thread(_get_visible_members_for_rows, rows)
+    if _match_key(canon) not in {_match_key(m) for m in members}:
+        members.append(canon)
+    stats = await asyncio.to_thread(compute_member_stats_for_period, members, rows, [today_str])
+    ranked = sorted(
+        stats,
+        key=lambda s: (int(s["total_joining"]), int(s["on_time"]), -int(s["gross_pen"])),
+        reverse=True,
+    )
+    my_key = _match_key(canon)
+    my_idx = next((i + 1 for i, s in enumerate(ranked) if str(s["key"]) == my_key), len(ranked))
+    my_st = next((s for s in ranked if str(s["key"]) == my_key), ranked[0])
+    target_val = get_daily_joining_target()
+    tgt_line = f"\n🎯 Target: {target_val} ({'+' if int(my_st['target_diff']) >= 0 else ''}{my_st['target_diff']})" if target_val > 0 else ""
+
+    await update.message.reply_text(
+        f"🏅 <b>My Daily Rank — {html.escape(canon)} ({today_str})</b>\n"
+        f"Your Position: <b>#{my_idx}</b> out of <b>{len(ranked)}</b> assistants\n"
+        f"Valid Daily Joining: <b>{my_st['total_joining']}</b>\n"
+        f"On-Time Slots: <b>{my_st['on_time']}/{max(len(my_st['allowed_slots']), 1)}</b> | Compliance: <b>{my_st['compliance']}%</b>"
+        f"{tgt_line}",
+        parse_mode="HTML",
+    )
+
+
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
+        return
+    if not await _require_admin(update):
         return
     target_date = datetime.now(IST).strftime("%Y-%m-%d")
     if context.args and re.match(r"^\d{4}-\d{2}-\d{2}$", context.args[0].strip()):
@@ -4083,8 +4494,7 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
-    if update.effective_chat.type == "private" and not _is_admin(update):
-        await update.message.reply_text("Unauthorized.")
+    if not await _require_admin(update):
         return
     month_str = datetime.now(IST).strftime("%Y-%m")
     if context.args:
@@ -4105,8 +4515,7 @@ async def monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def payout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
-    if update.effective_chat.type == "private" and not _is_admin(update):
-        await update.message.reply_text("Unauthorized.")
+    if not await _require_admin(update):
         return
     days = 7
     rate: Optional[int] = None
@@ -4139,8 +4548,7 @@ async def payout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def setrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    if not _is_admin(update):
-        await update.message.reply_text("Only the configured admin can set payout rate.")
+    if not await _require_admin(update):
         return
     if not context.args or not context.args[0].lstrip("₹").isdigit():
         await update.message.reply_text(
@@ -4194,6 +4602,8 @@ async def alias_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def aliases_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if not await _require_admin(update):
+        return
     pairs = await asyncio.to_thread(get_username_aliases)
     if not pairs:
         await update.message.reply_text("No username aliases linked yet. Use <code>/alias @old @new</code>.", parse_mode="HTML")
@@ -4207,15 +4617,14 @@ async def aliases_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def holiday_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if not await _require_admin(update):
+        return
     if not context.args:
         cur = get_setting("holiday_mode", "false")
         await update.message.reply_text(
             f"Holiday Mode is currently <b>{'ON' if cur == 'true' else 'OFF'}</b>.\nUse <code>/holiday on</code> or <code>/holiday off</code>.",
             parse_mode="HTML",
         )
-        return
-    if not _is_admin(update):
-        await update.message.reply_text("Only the configured admin can toggle Holiday Mode.")
         return
     arg = context.args[0].strip().lower()
     if arg in ("on", "true", "1", "yes"):
@@ -4231,15 +4640,14 @@ async def holiday_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def offdays_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if not await _require_admin(update):
+        return
     if not context.args:
         cur = get_setting("off_days", "") or "none"
         await update.message.reply_text(
             f"Recurring Off-Days: <b>{html.escape(cur.upper())}</b>\nUsage: <code>/offdays sun</code>, <code>/offdays sat,sun</code>, or <code>/offdays none</code>",
             parse_mode="HTML",
         )
-        return
-    if not _is_admin(update):
-        await update.message.reply_text("Only the configured admin can set weekly off-days.")
         return
     raw = ",".join(context.args).lower()
     if "none" in raw or "off" in raw:
@@ -4260,14 +4668,13 @@ async def offdays_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cleanchat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if not await _require_admin(update):
+        return
     if not context.args:
         await update.message.reply_text(
             f"Clean Chat Mode (auto-delete previous reminders): <b>{'ON' if is_clean_chat_enabled() else 'OFF'}</b>\nUse <code>/cleanchat on</code> or <code>/cleanchat off</code>",
             parse_mode="HTML",
         )
-        return
-    if not _is_admin(update):
-        await update.message.reply_text("Only the configured admin can toggle Clean Chat Mode.")
         return
     arg = context.args[0].strip().lower()
     if arg in ("on", "true", "1"):
@@ -4284,6 +4691,8 @@ async def setpenalty_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """/setpenalty regular 5 final 10 missed 15"""
     if not update.message:
         return
+    if not await _require_admin(update):
+        return
     reg_p, fin_p, miss_p = get_penalty_config()
     if not context.args:
         await update.message.reply_text(
@@ -4294,9 +4703,6 @@ async def setpenalty_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"Update: <code>/setpenalty regular 5 final 10 missed 15</code>",
             parse_mode="HTML",
         )
-        return
-    if not _is_admin(update):
-        await update.message.reply_text("Only the configured admin can change penalty rates.")
         return
     tokens = [t.strip().lower().lstrip("₹") for t in context.args]
     new_reg, new_fin, new_miss = reg_p, fin_p, miss_p
@@ -4331,6 +4737,8 @@ async def setpenalty_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def setshift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if not await _require_admin(update):
+        return
     if not context.args:
         shifts = await asyncio.to_thread(get_assistant_shifts)
         lines = [
@@ -4347,9 +4755,6 @@ async def setshift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lines.append("\nSet: <code>/setshift @user morning|evening|full</code>")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
-    if not _is_admin(update):
-        await update.message.reply_text("Only the configured admin can assign shifts.")
-        return
     if len(context.args) < 2 or context.args[1].strip().lower() not in SHIFT_SLOTS:
         await update.message.reply_text("Usage: <code>/setshift @user morning|evening|full</code>", parse_mode="HTML")
         return
@@ -4364,6 +4769,8 @@ async def setshift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
+        return
+    if not await _require_admin(update):
         return
     if not context.args:
         await update.message.reply_text("Usage: <code>/find @username [days=7]</code>", parse_mode="HTML")
@@ -4409,6 +4816,8 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def day_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
+        return
+    if not await _require_admin(update):
         return
     target_date = datetime.now(IST).strftime("%Y-%m-%d")
     if context.args:
@@ -4552,6 +4961,8 @@ async def removemember_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def team_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
+        return
+    if not await _require_admin(update):
         return
     sync_cid = (
         update.effective_chat.id
@@ -5953,6 +6364,44 @@ async def post_init(application: Application) -> None:
     for wg_id in work_gids:
         await refresh_group_admins(application.bot, wg_id, force=True)
 
+    # Scoped Telegram / command menus: Assistants see ONLY their 5 commands; Admin sees full control suite
+    assistant_menu = [
+        BotCommand("start", "Personal DM Alerts activate karein"),
+        BotCommand("mystatus", "Aaj ki apni valid joining & slots dekhein"),
+        BotCommand("myfine", "Apna fine balance & history dekhein"),
+        BotCommand("myrank", "Aaj ki apni rank & score dekhein"),
+        BotCommand("myhelp", "Assistant commands ki guide dekhein"),
+    ]
+    admin_menu = [
+        BotCommand("allfines", "Ek saath sabhi assistants ki penalty dekhein"),
+        BotCommand("resetfine", "Sabhi ya ek assistant ka fine ₹0 karein"),
+        BotCommand("summary", "Aaj ki poori team summary dekhein"),
+        BotCommand("leaderboard", "Full team leaderboard dekhein"),
+        BotCommand("excel", "Daily Excel report download karein"),
+        BotCommand("weekly", "7-day weekly Excel report"),
+        BotCommand("monthly", "Monthly Excel analytics"),
+        BotCommand("payout", "Team joining salary payout sheet"),
+        BotCommand("paid", "Fine payment record karein (/paid all ya @user amt)"),
+        BotCommand("paidall", "Sabhi assistants ka fine ek saath PAID (₹0) karein"),
+        BotCommand("waive", "Fine waive karein (/waive all ya @user amt)"),
+        BotCommand("dmstatus", "Started assistants DM status dekhein"),
+        BotCommand("dmall", "Sabhi started assistants ko DM bhejein"),
+        BotCommand("countdown", "Slot countdown start/stop karein"),
+        BotCommand("tags", "Tagged assistants manage karein"),
+        BotCommand("leave", "Assistant ki leave mark karein"),
+        BotCommand("restore", "Backup .db/.xlsx se data recover karein"),
+        BotCommand("help", "Sabhi admin commands dekhein"),
+    ]
+    try:
+        await application.bot.set_my_commands(assistant_menu, scope=BotCommandScopeDefault())
+        await application.bot.set_my_commands(assistant_menu, scope=BotCommandScopeAllGroupChats())
+        if DEFAULT_ADMIN_CHAT_ID is not None:
+            await application.bot.set_my_commands(
+                admin_menu, scope=BotCommandScopeChat(chat_id=DEFAULT_ADMIN_CHAT_ID)
+            )
+    except Exception as exc:
+        logger.warning("Could not register scoped BotCommands: %s", exc)
+
     if application.job_queue is None:
         return
 
@@ -6065,6 +6514,8 @@ def main() -> None:
     )
 
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("myhelp", myhelp_command))
+    application.add_handler(CommandHandler("myrank", myrank_command))
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler(["add", "record"], add_command))
     application.add_handler(CommandHandler("addreport", addreport_command))
@@ -6091,12 +6542,15 @@ def main() -> None:
     application.add_handler(CommandHandler("leaderboard", leaderboard_command))
     application.add_handler(CommandHandler(["removesummary", "hidesummary"], removesummary_command))
     application.add_handler(CommandHandler(["restoresummary", "addsummary"], restoresummary_command))
-    application.add_handler(CommandHandler("mystatus", mystatus_command))
+    application.add_handler(CommandHandler(["mystatus", "myreport"], mystatus_command))
     application.add_handler(CommandHandler("myfine", myfine_command))
+    application.add_handler(CommandHandler(["allfines", "allfine", "fines", "penalties", "allpenalty"], allfines_command))
     application.add_handler(CommandHandler("leave", leave_command))
     application.add_handler(CommandHandler("unleave", unleave_command))
     application.add_handler(CommandHandler("paid", paid_command))
+    application.add_handler(CommandHandler(["paidall", "clearpaid"], paidall_command))
     application.add_handler(CommandHandler("waive", waive_command))
+    application.add_handler(CommandHandler("waiveall", waiveall_command))
     application.add_handler(CommandHandler(["resetfine", "resetfines", "clearfine", "clearfines"], resetfine_command))
     application.add_handler(CommandHandler("settarget", settarget_command))
     application.add_handler(CommandHandler("alias", alias_command))
