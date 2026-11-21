@@ -1920,6 +1920,44 @@ def _dates_for_period(start_date: str, end_date: str) -> list[str]:
     return out
 
 
+def _get_fine_reset_state() -> tuple[str, Optional[int], dict[str, tuple[str, Optional[int]]]]:
+    reset_date = (get_setting("fine_reset_date", "") or "").strip()
+    reset_secs = _parse_optional_int(get_setting("fine_reset_time_secs", "") or "", "fine_reset_time_secs")
+    raw_map = get_setting("member_fine_reset_dates", "{}") or "{}"
+    m_map: dict[str, tuple[str, Optional[int]]] = {}
+    try:
+        parsed = json.loads(raw_map)
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                if isinstance(v, dict) and v.get("date"):
+                    m_map[str(k)] = (str(v["date"]), _parse_optional_int(str(v.get("secs", "") or ""), "member_reset_secs"))
+                elif isinstance(v, str) and v:
+                    m_map[str(k)] = (v, None)
+    except Exception:
+        pass
+    return reset_date, reset_secs, m_map
+
+
+def _get_member_first_active_dates() -> dict[str, str]:
+    out: dict[str, str] = {}
+    with sqlite3.connect(DB_PATH) as conn:
+        for uname, min_d in conn.execute(
+            "SELECT LOWER(LTRIM(username, '@')), MIN(report_date) FROM reports GROUP BY LOWER(LTRIM(username, '@'))"
+        ).fetchall():
+            if uname and min_d:
+                out[str(uname)] = str(min_d)
+        for tbl in ("team_members", "assistant_tags"):
+            for uname, added_at in conn.execute(
+                f"SELECT LOWER(LTRIM(username, '@')), COALESCE(added_at, '') FROM {tbl}"
+            ).fetchall():
+                k = str(uname or "")
+                d_part = str(added_at or "")[:10]
+                if k and re.match(r"^\d{4}-\d{2}-\d{2}$", d_part):
+                    if k not in out or d_part < out[k]:
+                        out[k] = d_part
+    return out
+
+
 def compute_member_stats_for_period(
     members: list[str],
     period_rows: list[tuple[str, str, str, str, str, str, int, str]],
@@ -1929,10 +1967,12 @@ def compute_member_stats_for_period(
     """
     Compute accurate member metrics across date_list:
       - Uses cumulative daily joining (latest slot value per day, NOT sum of slots!)
-      - Respects dynamic penalty rates, leaves, holidays/off-days, and assistant shifts
+      - Respects dynamic penalty rates, leaves, holidays/off-days, assistant shifts, and /resetfine baselines
+      - Never charges phantom Missed fines on empty/inactive historical days before tracking or member join
       - Includes Paid & Waived ledger adjustments to compute Balance Due
     """
     ref = now_ist or datetime.now(IST)
+    today_str = ref.strftime("%Y-%m-%d")
     reg_pen, fin_pen, missed_pen_rate = get_penalty_config()
     shifts_map = get_assistant_shifts()
     target_val = get_daily_joining_target()
@@ -1941,6 +1981,9 @@ def compute_member_stats_for_period(
         start_date=date_list[0] if date_list else None,
         end_date=date_list[-1] if date_list else None,
     )
+    fine_reset_date, fine_reset_secs, member_reset_map = _get_fine_reset_state()
+    member_first_dates = _get_member_first_active_dates()
+    active_report_dates = {str(r[4]) for r in period_rows}
 
     stats: list[dict[str, object]] = []
     for member in members:
@@ -1964,10 +2007,23 @@ def compute_member_stats_for_period(
         late_pen = sum(r[6] for r in member_rows)
         total_joining = compute_period_joining_from_rows(member_rows)
 
+        m_reset = member_reset_map.get(m_key)
+        m_first_date = member_first_dates.get(m_key)
+
         missed = 0
         expected_slots = 0
         leave_days = 0
         for d_str in date_list:
+            # Skip historical days with zero team activity (prevents fake 30-day missed fines on fresh/empty DBs)
+            if d_str < today_str and d_str not in active_report_dates:
+                continue
+            if fine_reset_date and d_str < fine_reset_date:
+                continue
+            if m_reset and d_str < m_reset[0]:
+                continue
+            if m_first_date and d_str < m_first_date:
+                continue
+
             d_closed = get_closed_slots_for_date(d_str, ref)
             d_leaves = leaves_by_date.get(d_str, {}).get(m_key, set())
             if "" in d_leaves:
@@ -1976,6 +2032,11 @@ def compute_member_stats_for_period(
             d_submitted = {r[3] for r in member_rows if r[4] == d_str}
             for s in d_closed:
                 if s.label not in allowed_slots or s.label in d_leaves:
+                    continue
+                s_end_secs = _time_to_secs(s.end)
+                if fine_reset_date == d_str and fine_reset_secs is not None and s_end_secs <= fine_reset_secs:
+                    continue
+                if m_reset and m_reset[0] == d_str and m_reset[1] is not None and s_end_secs <= int(m_reset[1]):
                     continue
                 expected_slots += 1
                 if s.label not in d_submitted:
@@ -1986,7 +2047,13 @@ def compute_member_stats_for_period(
         paid_rs, waived_rs = ledger_map.get(m_key, (0, 0))
         balance_due = max(0, gross_pen - paid_rs - waived_rs)
         compliance = round((on_time / expected_slots) * 100) if expected_slots else 100
-        target_diff = (total_joining - (target_val * max(1, len(date_list) - leave_days))) if target_val > 0 else 0
+        active_day_cnt = sum(
+            1 for d_str in date_list
+            if (d_str == today_str or d_str in active_report_dates)
+            and not (fine_reset_date and d_str < fine_reset_date)
+            and not (m_first_date and d_str < m_first_date)
+        )
+        target_diff = (total_joining - (target_val * max(1, active_day_cnt - leave_days))) if target_val > 0 else 0
 
         stats.append(
             {
@@ -2451,6 +2518,10 @@ def restore_from_sqlite_bytes(db_bytes: bytes) -> dict[str, object]:
                         "penalty_late_final",
                         "penalty_missed",
                         "dm_started_users",
+                        "dm_started_profiles",
+                        "fine_reset_date",
+                        "fine_reset_time_secs",
+                        "member_fine_reset_dates",
                     ) and val is not None:
                         dst.execute(
                             "INSERT INTO bot_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -2960,6 +3031,7 @@ def _is_admin(update: Update) -> bool:
 def mark_user_dm_started(user_id: Optional[int], username: str = "") -> None:
     if user_id is None:
         return
+    uid_int = int(user_id)
     raw = get_setting("dm_started_users", "[]")
     try:
         arr = json.loads(raw or "[]")
@@ -2967,10 +3039,22 @@ def mark_user_dm_started(user_id: Optional[int], username: str = "") -> None:
             arr = []
     except Exception:
         arr = []
-    uid_int = int(user_id)
     if uid_int not in arr:
         arr.append(uid_int)
         set_setting("dm_started_users", json.dumps(arr))
+
+    if username:
+        raw_p = get_setting("dm_started_profiles", "{}")
+        try:
+            prof = json.loads(raw_p or "{}")
+            if not isinstance(prof, dict):
+                prof = {}
+        except Exception:
+            prof = {}
+        clean_u = _normalize_tag(username) or username.strip()
+        if prof.get(str(uid_int)) != clean_u:
+            prof[str(uid_int)] = clean_u
+            set_setting("dm_started_profiles", json.dumps(prof))
 
 
 def get_dm_started_user_ids() -> set[int]:
@@ -2980,6 +3064,29 @@ def get_dm_started_user_ids() -> set[int]:
         return {int(x) for x in arr if str(x).lstrip("-").isdigit()} if isinstance(arr, list) else set()
     except Exception:
         return set()
+
+
+def get_dm_started_profiles() -> dict[int, str]:
+    raw_p = get_setting("dm_started_profiles", "{}")
+    out: dict[int, str] = {}
+    try:
+        prof = json.loads(raw_p or "{}")
+        if isinstance(prof, dict):
+            for k, v in prof.items():
+                if str(k).lstrip("-").isdigit():
+                    out[int(k)] = str(v)
+    except Exception:
+        pass
+    for uid in get_dm_started_user_ids():
+        out.setdefault(uid, f"User {uid}")
+    # Also enrich display usernames from assistant_tags / team_members if available
+    with sqlite3.connect(DB_PATH) as conn:
+        for uid, uname in conn.execute(
+            "SELECT user_id, username FROM assistant_tags WHERE user_id IS NOT NULL UNION SELECT user_id, username FROM team_members WHERE user_id IS NOT NULL"
+        ).fetchall():
+            if uid is not None and int(uid) in out and uname:
+                out[int(uid)] = str(uname)
+    return out
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3026,13 +3133,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"/summary | /leaderboard | /mystatus | /myfine [@user]\n"
         f"/find @user [days] | /day [YYYY-MM-DD]\n\n"
         f"<b>Assistant DM Alerts (/start Only — Admins Excluded):</b>\n"
-        f"/dmstatus | /dmtest @assistant\n\n"
+        f"/dmstatus | /dmtest @assistant | /dmall [message]\n\n"
         f"<b>Admin Controls &amp; Backfill:</b>\n"
         f"/add (reply) | /addreport @user 40 [10am]\n"
         f"/tags | /settags @a @b | /addtag | /removetag | /cleartags\n"
         f"/reminder on|off | /cleanchat on|off | /countdown [slot|stop]\n"
         f"/leave @user [date] [slot] | /unleave @user [date]\n"
-        f"/paid @user amt | /waive @user amt | /setshift @user morning|evening|full\n"
+        f"/paid @user amt | /waive @user amt | /resetfine [@user|all] | /setshift @user morning|evening|full\n"
         f"/settarget N | /setrate Rs | /setpenalty regular 5 final 10 missed 15\n"
         f"/holiday on|off | /offdays sun|sat,sun|none | /alias @old @new | /aliases\n"
         f"/removesummary @a | /restoresummary @a | /restore\n"
@@ -3900,6 +4007,69 @@ async def waive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _handle_ledger_command(update, context, "waive")
 
 
+async def resetfine_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /resetfine [@user | all] to reset existing late/missed/balance fines to ₹0."""
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only the configured admin can reset fines.")
+        return
+
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    now_secs = _time_to_secs(now_ist.time().replace(tzinfo=None))
+    target = context.args[0].strip() if context.args else "all"
+
+    if target.lower() in ("all", "*", "team", "everyone"):
+        def _reset_all() -> int:
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.execute("UPDATE reports SET penalty_rs = 0 WHERE penalty_rs != 0")
+                conn.execute("DELETE FROM penalty_ledger")
+                conn.commit()
+                changed = cur.rowcount
+            set_setting("fine_reset_date", today_str)
+            set_setting("fine_reset_time_secs", str(now_secs))
+            set_setting("member_fine_reset_dates", "{}")
+            return changed
+
+        cleared_rows = await asyncio.to_thread(_reset_all)
+        await update.message.reply_text(
+            f"✅ <b>All Team Fines Reset to ₹0!</b>\n"
+            f"Reset Date Baseline: <b>{today_str} ({now_ist.strftime('%I:%M %p IST')})</b>\n"
+            f"Cleared Late Penalty Rows: <b>{cleared_rows}</b>\n"
+            f"<i>Sabhi assistants ka Gross, Missed aur Net Balance ab ₹0 hai.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        canon = _resolve_canonical_name(conn, target) or _normalize_tag(target) or target
+        m_key = _match_key(canon)
+        cur = conn.execute(
+            "UPDATE reports SET penalty_rs = 0 WHERE LOWER(LTRIM(username, '@')) = ? AND penalty_rs != 0",
+            (m_key,),
+        )
+        conn.execute("DELETE FROM penalty_ledger WHERE username_key = ?", (m_key,))
+        conn.commit()
+        changed = cur.rowcount
+
+    raw_map = get_setting("member_fine_reset_dates", "{}") or "{}"
+    try:
+        m_map = json.loads(raw_map)
+        if not isinstance(m_map, dict):
+            m_map = {}
+    except Exception:
+        m_map = {}
+    m_map[m_key] = {"date": today_str, "secs": now_secs}
+    await asyncio.to_thread(set_setting, "member_fine_reset_dates", json.dumps(m_map))
+
+    await update.message.reply_text(
+        f"✅ <b>Fine Reset to ₹0 for {html.escape(canon)}!</b>\n"
+        f"Cleared Late Rows: <b>{changed}</b> | Baseline: <b>{today_str} ({now_ist.strftime('%I:%M %p IST')})</b>",
+        parse_mode="HTML",
+    )
+
+
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -4696,7 +4866,7 @@ async def _get_bot_username(bot) -> str:
 
 
 async def notify_pending_via_dm(
-    bot, slot_label: str, pending: list[tuple[str, Optional[int]]]
+    bot, slot_label: str, pending: list[tuple[str, Optional[int]]], stage: str = "countdown"
 ) -> None:
     """Send urgent personal DM via Bot API ONLY to pending non-admin assistants who have clicked /start."""
     if not is_reminders_enabled():
@@ -4706,15 +4876,47 @@ async def notify_pending_via_dm(
     for uname, uid in pending:
         if is_known_group_admin(uname, uid):
             continue
-        dm_text = (
-            f"⏰ <b>Urgent Report Reminder ({html.escape(slot_label)})</b>\n"
-            f"Hi {html.escape(uname)}, aapki report abhi pending hai!\n"
-            f"Abhi submit karne par Late Penalty <b>₹{late_amt}</b> hai (Miss hone par <b>₹{missed_pen}</b>)."
-        )
+        if stage == "open":
+            dm_text = (
+                f"📢 <b>{html.escape(slot_label)} Report Open!</b>\n"
+                f"Hi {html.escape(uname)}, apni report (Username + Joining) group mein submit karein.\n"
+                f"On-Time rehne par Penalty: <b>₹0</b> (Late: ₹{late_amt} | Missed: ₹{missed_pen})."
+            )
+        elif stage == "5min":
+            dm_text = (
+                f"⚡ <b>5 Minutes Left — {html.escape(slot_label)}</b>\n"
+                f"Hi {html.escape(uname)}, ₹0 penalty ke liye sirf <b>5 minutes</b> bache hain!\n"
+                f"Jaldi group mein report send karein."
+            )
+        elif stage == "8pm_final":
+            dm_text = (
+                f"🚨 <b>8:00 PM LAST WARNING — Final Report</b>\n"
+                f"Hi {html.escape(uname)}, On-Time window close ho gaya hai!\n"
+                f"Abhi submit karne par Late Penalty <b>₹{late_amt}</b> hai (Miss hone par <b>₹{missed_pen}</b>)."
+            )
+        else:
+            dm_text = (
+                f"⏰ <b>Urgent Report Reminder ({html.escape(slot_label)})</b>\n"
+                f"Hi {html.escape(uname)}, aapki report abhi pending hai!\n"
+                f"Abhi submit karne par Late Penalty <b>₹{late_amt}</b> hai (Miss hone par <b>₹{missed_pen}</b>)."
+            )
         ok, via = await send_dm_to_assistant(bot, uname, uid, dm_text)
         if not ok:
             logger.debug("Assistant DM skipped for %s: %s", uname, via)
         await asyncio.sleep(0.35)
+
+
+async def handle_any_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Passively record user_id & username of anyone who has already started the bot in Private DM."""
+    if not update.effective_chat or update.effective_chat.type != "private" or not update.effective_user:
+        return
+    user = update.effective_user
+    if getattr(user, "is_bot", False):
+        return
+    uname = f"@{user.username}" if user.username else (user.first_name or "Assistant")
+    await asyncio.to_thread(mark_user_dm_started, user.id, uname)
+    if not _is_admin(update) and not is_known_group_admin(uname, user.id):
+        await asyncio.to_thread(auto_discover_assistant, uname, user.id)
 
 
 async def dmstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4726,22 +4928,107 @@ async def dmstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     work_gid = get_work_group_id()
     await refresh_group_admins(context.bot, work_gid, force=True)
     tagged = await asyncio.to_thread(get_tagged_assistants_with_ids)
-    started_ids = await asyncio.to_thread(get_dm_started_user_ids)
+    started_profiles = await asyncio.to_thread(get_dm_started_profiles)
 
-    non_admin_assistants = [(u, uid) for u, uid in tagged if not is_known_group_admin(u, uid)]
+    seen_keys: set[str] = set()
+    non_admin_assistants: list[tuple[str, Optional[int]]] = []
+    for u, uid in tagged:
+        if is_known_group_admin(u, uid):
+            continue
+        seen_keys.add(_match_key(u))
+        non_admin_assistants.append((u, uid))
+    for uid, u in started_profiles.items():
+        if DEFAULT_ADMIN_CHAT_ID is not None and uid == DEFAULT_ADMIN_CHAT_ID:
+            continue
+        if is_known_group_admin(u, uid):
+            continue
+        if _match_key(u) not in seen_keys:
+            seen_keys.add(_match_key(u))
+            non_admin_assistants.append((u, uid))
+
     lines = [
         "<b>Assistant DM Delivery Status (/start Only | Admins Strictly Excluded)</b>",
         f"Active Non-Admin Assistants: <b>{len(non_admin_assistants)}</b>\n",
     ]
     for uname, uid in non_admin_assistants:
-        if uid is not None and uid in started_ids:
+        if uid is not None and uid in started_profiles:
             status = "✅ Bot DM Ready (/start done)"
         else:
             status = "⏳ Needs /start (Tap 1-Tap DM button in group countdown)"
         lines.append(f"- {html.escape(uname)}: {status}")
     if not non_admin_assistants:
-        lines.append("No active tagged non-admin assistants.")
-    lines.append("\nTest anytime: <code>/dmtest @assistant</code>")
+        lines.append("No active non-admin assistants yet.")
+    lines.append("\nCommands: <code>/dmtest @assistant</code> | <code>/dmall [message]</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def dmall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /dmall [optional message] to immediately DM all non-admin assistants who already clicked /start."""
+    if not update.message:
+        return
+    if not _is_admin(update):
+        await update.message.reply_text("Only admin can send DMs to started assistants.")
+        return
+
+    work_gid = get_work_group_id()
+    await refresh_group_admins(context.bot, work_gid, force=True)
+    started_profiles = await asyncio.to_thread(get_dm_started_profiles)
+    tagged = await asyncio.to_thread(get_tagged_assistants_with_ids)
+
+    candidates: dict[int, str] = {}
+    for uid, uname in started_profiles.items():
+        if DEFAULT_ADMIN_CHAT_ID is not None and uid == DEFAULT_ADMIN_CHAT_ID:
+            continue
+        if is_known_group_admin(uname, uid):
+            continue
+        candidates[uid] = uname
+    for uname, uid in tagged:
+        if uid is not None and uid not in candidates and not is_known_group_admin(uname, uid):
+            candidates[uid] = uname
+
+    if not candidates:
+        await update.message.reply_text(
+            "Abhi tak kisi bhi non-admin Assistant ka /start user ID record nahi hua hai.\n"
+            "Group countdown ke 1-Tap button ya <code>/start</code> se activate hote hi unko DM chala jayega.",
+            parse_mode="HTML",
+        )
+        return
+
+    custom_msg = " ".join(context.args).strip()
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+    active_slot = detect_active_slot(now_ist)
+
+    delivered: list[str] = []
+    skipped_unstarted: list[str] = []
+    for uid, uname in candidates.items():
+        if custom_msg:
+            dm_text = f"📢 <b>Admin Reminder for {html.escape(uname)}</b>\n{html.escape(custom_msg)}"
+        elif active_slot:
+            dm_text = (
+                f"⏰ <b>Report Reminder ({html.escape(active_slot)})</b>\n"
+                f"Hi {html.escape(uname)}, apni report (Username + Joining) group mein submit kar dein."
+            )
+        else:
+            today_slots = await asyncio.to_thread(fetch_user_today_slots, uname, today_str)
+            dm_text = (
+                f"🔔 <b>Personal DM Alerts Active ({today_str})</b>\n"
+                f"Hi {html.escape(uname)}, aaj aapki <b>{len(today_slots)}/5</b> slot reports recorded hain.\n"
+                f"Agle slots par aapko direct DM alert time par milega!"
+            )
+        ok, _why = await send_dm_to_assistant(context.bot, uname, uid, dm_text)
+        if ok:
+            delivered.append(uname)
+        else:
+            skipped_unstarted.append(uname)
+        await asyncio.sleep(0.25)
+
+    lines = [
+        f"📨 <b>DM Broadcast Report (/start Assistants Only)</b>",
+        f"✅ Delivered ({len(delivered)}): {', '.join(html.escape(u) for u in delivered) if delivered else 'None'}",
+    ]
+    if skipped_unstarted:
+        lines.append(f"⏳ Not Started Yet ({len(skipped_unstarted)}): {', '.join(html.escape(u) for u in skipped_unstarted)}")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -4763,6 +5050,11 @@ async def dmtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             (_match_key(canon), _match_key(canon)),
         ).fetchone()
     uid = int(row[0]) if (row and row[0] is not None) else None
+    if uid is None:
+        for p_uid, p_uname in get_dm_started_profiles().items():
+            if _match_key(p_uname) == _match_key(canon):
+                uid = p_uid
+                break
     if is_known_group_admin(canon, uid):
         await update.message.reply_text("🚫 Rejected: Ye user Group Admin hai — DM sirf non-admin Assistants ko jaata hai!")
         return
@@ -5104,6 +5396,8 @@ async def send_slot_open_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> Non
             await _record_reminder_message(work_group_id, sent.message_id)
         except Exception as exc:
             logger.warning("Could not send slot-open reminder to %s: %s", work_group_id, exc)
+    if tagged_pairs:
+        asyncio.create_task(notify_pending_via_dm(context.bot, slot_label, tagged_pairs, stage="open"))
 
 
 async def send_slot_final_warning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5145,6 +5439,7 @@ async def send_slot_final_warning_job(context: ContextTypes.DEFAULT_TYPE) -> Non
             await _record_reminder_message(work_group_id, sent.message_id)
         except Exception as exc:
             logger.warning("Could not send 5-min final warning to %s: %s", work_group_id, exc)
+    asyncio.create_task(notify_pending_via_dm(context.bot, slot_label, pending, stage="5min"))
 
 
 async def send_final_8pm_last_warning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5178,6 +5473,7 @@ async def send_final_8pm_last_warning_job(context: ContextTypes.DEFAULT_TYPE) ->
             await _record_reminder_message(work_group_id, sent.message_id)
         except Exception as exc:
             logger.warning("Could not send 8:00 PM last warning to %s: %s", work_group_id, exc)
+    asyncio.create_task(notify_pending_via_dm(context.bot, FINAL_SLOT_LABEL, pending, stage="8pm_final"))
 
 
 async def start_penalty_countdown_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5753,6 +6049,12 @@ def main() -> None:
         .build()
     )
 
+    # Passively track non-admin assistants who have already started the bot in Private DM
+    application.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE, handle_any_private_message),
+        group=-2,
+    )
+
     # Run assistant auto-discovery in group=-1 on ALL group messages (new + edited)
     application.add_handler(
         MessageHandler(
@@ -5795,6 +6097,7 @@ def main() -> None:
     application.add_handler(CommandHandler("unleave", unleave_command))
     application.add_handler(CommandHandler("paid", paid_command))
     application.add_handler(CommandHandler("waive", waive_command))
+    application.add_handler(CommandHandler(["resetfine", "resetfines", "clearfine", "clearfines"], resetfine_command))
     application.add_handler(CommandHandler("settarget", settarget_command))
     application.add_handler(CommandHandler("alias", alias_command))
     application.add_handler(CommandHandler("aliases", aliases_command))
@@ -5810,6 +6113,7 @@ def main() -> None:
     application.add_handler(CommandHandler("team", team_command))
     application.add_handler(CommandHandler("dmstatus", dmstatus_command))
     application.add_handler(CommandHandler("dmtest", dmtest_command))
+    application.add_handler(CommandHandler(["dmall", "dmremind", "senddm"], dmall_command))
     application.add_handler(CommandHandler(["restore", "recover"], restore_command))
 
     # Auto-restore when Admin forwards/sends .db or .xlsx in Database Group or Admin DM

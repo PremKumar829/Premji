@@ -272,9 +272,9 @@ export const BOT_COMMANDS: BotCommandInfo[] = [
     description: 'Removes or restores any assistant name from the Telegram Summary format & Excel Member Summary / Slot Matrix sheets.',
   },
   {
-    command: '/dmstatus & /dmtest @assistant',
+    command: '/dmstatus, /dmtest & /dmall [msg]',
     scope: 'Admin Only',
-    description: 'Tracks which non-admin Assistants have clicked /start (or tapped the 1-tap Enable Personal DM Alerts button on countdowns) to receive personal DM reminders. Group Admins are strictly excluded.',
+    description: 'Tracks which non-admin Assistants have clicked /start and lets you send instant or automatic slot DMs to all started assistants (Group Admins strictly excluded). Use /resetfine [@user|all] to zero all fines.',
   },
   {
     command: '/restore (or /recover)',
